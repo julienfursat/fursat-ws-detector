@@ -35,16 +35,7 @@ async function main(): Promise<void> {
     logLevel: process.env.LOG_LEVEL ?? "info",
   });
 
-  logger.info("ENV DEBUG", {
-  hasUpstashUrl: !!process.env.UPSTASH_REDIS_REST_URL,
-  hasUpstashToken: !!process.env.UPSTASH_REDIS_REST_TOKEN,
-  upstashUrlLength: (process.env.UPSTASH_REDIS_REST_URL ?? "").length,
-  upstashTokenLength: (process.env.UPSTASH_REDIS_REST_TOKEN ?? "").length,
-  upstashUrlPrefix: (process.env.UPSTASH_REDIS_REST_URL ?? "").slice(0, 15),
-  logLevelSeen: process.env.LOG_LEVEL ?? "(unset)",
-  allUpstashKeys: Object.keys(process.env).filter(k => k.toUpperCase().includes("UPSTASH")),
-});
-
+  
   // 1+2. Discover products
   const discovered = await fetchTradableSymbols();
   const symbols = applySymbolOverride(discovered);
