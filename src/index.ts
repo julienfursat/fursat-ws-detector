@@ -60,6 +60,10 @@ async function main(): Promise<void> {
   let totalTicks = 0;
   const onTick = (tick: Tick): void => {
     totalTicks++;
+    // Heartbeat is throttled internally to ≤1 write per 30s (see redis.ts).
+    // Calling it on every tick means: if the WS goes silent, the heartbeat
+    // stops updating — which is exactly the signal we want to monitor on.
+    void writeHeartbeat();
     if (totalTicks % TICK_DEBUG_SAMPLE_RATE === 0) {
       logger.debug("Tick sample", {
         symbol: tick.symbol,
@@ -77,11 +81,11 @@ async function main(): Promise<void> {
   // 5. Start HTTP health server (after stream so the provider has stats available)
   const httpServer = startHealthServer(PORT, stream);
 
-  // 6. Periodic stats log + Redis heartbeat
-  const statsTimer = setInterval(async () => {
+  // 6. Periodic stats log (every 5 min)
+  // Heartbeat is now written in onTick (throttled to 30s), not here.
+  const statsTimer = setInterval(() => {
     const s = stream.stats();
     logger.info("Stats", s);
-    await writeHeartbeat();
   }, STATS_LOG_INTERVAL_MS);
 
   // 7. Periodic product refresh — re-subscribe if the universe changed
