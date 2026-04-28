@@ -1,8 +1,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// coinbase-ws.ts — WebSocket connection to Coinbase Advanced public ticker
+// coinbase-ws.ts — WebSocket connection to Coinbase Advanced authenticated ticker
 // ─────────────────────────────────────────────────────────────────────────────
-// Connects to wss://advanced-trade-ws.coinbase.com, subscribes to the public
-// `ticker` channel for a list of product IDs, and emits parsed Tick events.
+// Connects to wss://advanced-trade-ws.coinbase.com, subscribes to the `ticker`
+// channel for a list of product IDs WITH JWT authentication, and emits parsed
+// Tick events.
+//
+// Authentication: Coinbase Advanced WS requires a CDP JWT in the subscribe
+// payload to receive a full tick stream. Without it, the channel pushes only
+// sporadic events (~7 ticks/min observed across 235 pairs) — confirmed empirically.
+// We re-sign a fresh JWT on every subscribe (token TTL is 120s, signing is ~1ms).
 //
 // Resilience:
 //   • Reconnect with exponential backoff (1s → 30s cap)
@@ -11,9 +17,9 @@
 //   • Graceful close on SIGTERM / SIGINT
 //
 // Coinbase Advanced WS specs:
-//   • Public `ticker` channel does NOT require authentication
-//   • Subscribe message: { type: "subscribe", channel: "ticker", product_ids: [...] }
-//   • Server pushes "subscriptions" confirmation, then "ticker" events
+//   • Subscribe message: { type: "subscribe", channel: "ticker", product_ids: [...], jwt: "..." }
+//   • Server pushes "subscriptions" confirmation, then "ticker" envelopes with
+//     events[].tickers[] arrays
 //   • Server pings periodically; ws library auto-pongs (we don't need to handle it)
 //
 // Reference: https://docs.cloud.coinbase.com/advanced-trade/docs/ws-overview
@@ -21,6 +27,7 @@
 
 import WebSocket from "ws";
 import { logger } from "./logger.js";
+import { buildWsJWT } from "./jwt.js";
 
 const COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com";
 
@@ -70,6 +77,8 @@ export class CoinbaseTickerStream {
   private ws: WebSocket | null = null;
   private productIds: string[];
   private onTick: TickHandler;
+  private apiKey: string;
+  private apiSecret: string;
 
   private reconnectAttempt = 0;
   private connectedAt = 0;
@@ -82,9 +91,16 @@ export class CoinbaseTickerStream {
   private connectionsOpened = 0;
   private reconnects = 0;
 
-  constructor(productIds: string[], onTick: TickHandler) {
+  constructor(
+    productIds: string[],
+    onTick: TickHandler,
+    apiKey: string,
+    apiSecret: string
+  ) {
     this.productIds = productIds;
     this.onTick = onTick;
+    this.apiKey = apiKey;
+    this.apiSecret = apiSecret;
   }
 
   start(): void {
@@ -176,16 +192,26 @@ export class CoinbaseTickerStream {
 
   private subscribeAll(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    // Coinbase accepts large arrays but we batch defensively to be safe
+    // Build a fresh JWT for this subscribe wave. All batches in the same wave
+    // share the same JWT — Coinbase Advanced accepts that. JWT TTL is 120s,
+    // we send all batches synchronously so we're well within the window.
+    let jwt: string;
+    try {
+      jwt = buildWsJWT(this.apiKey, this.apiSecret);
+    } catch (err) {
+      logger.error("Failed to build WS JWT", { err: (err as Error).message });
+      return;
+    }
     for (let i = 0; i < this.productIds.length; i += SUBSCRIBE_BATCH_SIZE) {
       const batch = this.productIds.slice(i, i + SUBSCRIBE_BATCH_SIZE);
       this.ws.send(JSON.stringify({
         type: "subscribe",
         channel: "ticker",
         product_ids: batch,
+        jwt,
       }));
     }
-    logger.info("Subscribe sent", {
+    logger.info("Subscribe sent (authenticated)", {
       products: this.productIds.length,
       batches: Math.ceil(this.productIds.length / SUBSCRIBE_BATCH_SIZE),
     });
@@ -218,10 +244,23 @@ export class CoinbaseTickerStream {
     for (const event of env.events ?? []) {
       for (const ticker of event.tickers ?? []) {
         const productId = ticker.product_id;
-        if (!productId || !productId.endsWith("-USDC")) continue;
+        // Coinbase Advanced WS returns events with product_id `-USD` even when
+        // we subscribed to `-USDC` pairs (their matching engine uses USD as the
+        // canonical quote, USDC is treated as equivalent for the ticker stream).
+        // We accept both suffixes and normalize the symbol by stripping either.
+        // For trade execution (later, étape 6+) we'll trade on `-USDC` explicitly
+        // via the REST API — this only affects how we observe price data.
+        if (!productId) continue;
+        let symbol: string;
+        if (productId.endsWith("-USDC")) {
+          symbol = productId.slice(0, -5);
+        } else if (productId.endsWith("-USD")) {
+          symbol = productId.slice(0, -4);
+        } else {
+          continue;
+        }
         const price = parseFloat(ticker.price ?? "0");
         if (!(price > 0)) continue;
-        const symbol = productId.replace("-USDC", "");
         const tick: Tick = {
           symbol,
           productId,
