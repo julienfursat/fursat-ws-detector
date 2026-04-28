@@ -35,7 +35,6 @@ async function main(): Promise<void> {
     logLevel: process.env.LOG_LEVEL ?? "info",
   });
 
-  
   // 1+2. Discover products
   const discovered = await fetchTradableSymbols();
   const symbols = applySymbolOverride(discovered);
@@ -44,6 +43,18 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   const productIds = [...symbols].map(s => `${s}-USDC`);
+
+  // 2.5. Coinbase credentials for WS auth (REQUIRED — Coinbase Advanced WS
+  // pushes only sporadic events without authentication)
+  const apiKey = process.env.COINBASE_API_KEY ?? "";
+  const apiSecret = process.env.COINBASE_API_SECRET ?? "";
+  if (!apiKey || !apiSecret) {
+    logger.error("Coinbase credentials missing — aborting", {
+      hasKey: !!apiKey,
+      hasSecret: !!apiSecret,
+    });
+    process.exit(1);
+  }
 
   // 3. Tick handler — minimal at this stage
   let totalTicks = 0;
@@ -60,7 +71,7 @@ async function main(): Promise<void> {
   };
 
   // 4. Start WS
-  const stream = new CoinbaseTickerStream(productIds, onTick);
+  const stream = new CoinbaseTickerStream(productIds, onTick, apiKey, apiSecret);
   stream.start();
 
   // 5. Start HTTP health server (after stream so the provider has stats available)
