@@ -215,9 +215,13 @@ export class Detector {
       });
 
       // Étape 2B: dispatch alt_pump candidates only.
+      // Skip WEAK signals: entry.ts always refuses them with signal_too_weak.
+      // Sending them generates 2-3 dispatches per signal (WEAK candidate fires
+      // every tick that crosses change1h ≥ 8%) for nothing.
       // Other signal types (major_crash, position_crash, major_pump) need
       // MANAGE involvement and are logged-only for now.
-      if (result.candidate.signalType === "alt_pump") {
+      if (result.candidate.signalType === "alt_pump"
+          && result.candidate.severity !== "weak") {
         void this.tryDispatch(result.candidate);
       }
     } else if (result.reason !== "no_signal") {
