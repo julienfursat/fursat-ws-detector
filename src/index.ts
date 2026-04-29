@@ -1,170 +1,254 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// index.ts — fursat-ws-detector entry point (étape 2B)
+// ring-buffers.ts — Ring buffers per-asset for 5m/15m/1h/4h price snapshots
 // ─────────────────────────────────────────────────────────────────────────────
-// Bootstrap sequence:
-//   1. Fetch tradable *-USDC products from Coinbase REST
-//   2. Apply optional SYMBOL_OVERRIDE filter (testing)
-//   3. Verify Coinbase credentials (required for WS auth)
-//   4. Start ring buffers (5m/15m/1h/4h history)
-//   5. PRELOAD ring buffers from scan:price_snapshots (warm start)
-//   6. Start detector (event-driven on every tick)
-//   7. Start the Coinbase ticker WS stream
-//   8. Start the HTTP health server
-//   9. Periodic stats log + product refresh
-//  10. Graceful shutdown handlers
+// Maintains a circular buffer of historical prices per asset, snapshotted at
+// regular intervals. Allows O(1) lookup of "what was the price N minutes ago"
+// to compute change5m, change15m, change1h, change4h on any given tick.
 //
-// Étape 2B behavior:
-//   • Receives ticks → updates ring buffers → invokes detector
-//   • Detector classifies signals → for alt_pump candidates only:
-//     - Pre-checks (throttle, blacklist)
-//     - Dispatches to fursat.net /api/agent/entry
-//   • Logs all detections in dryrun:detected_signals_log
-//   • Logs all dispatches in worker:dispatches_log
-//   • scan.ts continues to run as a safety net (shared throttle prevents double dispatch)
+// Memory layout (per asset):
+//   • currentPrice      : updated on every tick
+//   • currentVolume24h  : updated on every tick
+//   • shortBuffer       : Float64Array(720) — 720 snapshots × 5s = 1h history
+//                         Used for change5m, change15m, change1h
+//   • longBuffer        : Float64Array(480) — 480 snapshots × 30s = 4h history
+//                         Used for change4h and the 2h peak window (for drawdown)
+//
+// Snapshots are written by a single timer (every 5s for short, every 30s for long).
+// When a buffer slot is uninitialized (just-listed asset, < N min of history),
+// the value stored is NaN — readers test isNaN() and return null for that change.
+//
+// Total memory: ~250 assets × (720 + 480) floats × 8 bytes ≈ 2.4 MB. Trivial.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { logger } from "./logger.js";
-import { fetchTradableSymbols, applySymbolOverride } from "./products.js";
-import { CoinbaseTickerStream, type Tick } from "./coinbase-ws.js";
-import { startHealthServer, type HealthProvider } from "./health-server.js";
-import { writeHeartbeat } from "./redis.js";
-import { RingBuffers } from "./ring-buffers.js";
-import { Detector } from "./detector.js";
-import { preloadRingBuffers } from "./preload.js";
 
-const PORT = parseInt(process.env.PORT ?? "8080", 10);
-const PRODUCT_REFRESH_INTERVAL_MS = 60 * 60_000;  // refresh products every hour
-const STATS_LOG_INTERVAL_MS = 5 * 60_000;          // log stats every 5 min
-const TICK_DEBUG_SAMPLE_RATE = 50_000;             // log 1 tick out of N at debug
+const SHORT_INTERVAL_MS = 5_000;       // 5s between short snapshots
+const SHORT_BUFFER_SIZE = 720;         // 720 × 5s = 3600s = 1h
+const LONG_INTERVAL_MS = 30_000;       // 30s between long snapshots
+const LONG_BUFFER_SIZE = 480;          // 480 × 30s = 14400s = 4h
 
-async function main(): Promise<void> {
-  logger.info("Starting fursat-ws-detector (étape 2B — ring buffers + dispatch)", {
-    nodeVersion: process.version,
-    port: PORT,
-    logLevel: process.env.LOG_LEVEL ?? "info",
-  });
+// Lookup offsets in the short buffer (in slots)
+const SHORT_OFFSET_5M = Math.round((5 * 60_000) / SHORT_INTERVAL_MS);   // 60
+const SHORT_OFFSET_15M = Math.round((15 * 60_000) / SHORT_INTERVAL_MS); // 180
+const SHORT_OFFSET_30M = Math.round((30 * 60_000) / SHORT_INTERVAL_MS); // 360
+const SHORT_OFFSET_1H = Math.round((60 * 60_000) / SHORT_INTERVAL_MS);  // 720 (= full buffer)
+// Lookup offsets in the long buffer
+const LONG_OFFSET_4H = Math.round((4 * 60 * 60_000) / LONG_INTERVAL_MS); // 480 (= full buffer)
+const LONG_OFFSET_2H = Math.round((2 * 60 * 60_000) / LONG_INTERVAL_MS); // 240
 
-  // 1+2. Discover products
-  const discovered = await fetchTradableSymbols();
-  const symbols = applySymbolOverride(discovered);
-  if (symbols.size === 0) {
-    logger.error("No symbols to subscribe — aborting");
-    process.exit(1);
-  }
-  const productIds = [...symbols].map(s => `${s}-USDC`);
-
-  // 3. Coinbase credentials for WS auth
-  const apiKey = process.env.COINBASE_API_KEY ?? "";
-  const apiSecret = process.env.COINBASE_API_SECRET ?? "";
-  if (!apiKey || !apiSecret) {
-    logger.error("Coinbase credentials missing — aborting", {
-      hasKey: !!apiKey,
-      hasSecret: !!apiSecret,
-    });
-    process.exit(1);
-  }
-
-  // 4. Ring buffers
-  const ringBuffers = new RingBuffers();
-  ringBuffers.start();
-
-  // 5. Preload from scan:price_snapshots (warm start — avoids 1h cold-start
-  // window where change1h is null and most signals are filtered)
-  await preloadRingBuffers(ringBuffers, symbols);
-
-  // 6. Detector
-  // heldSymbolsProvider: at étape 2B we don't poll positions yet, so always
-  // return an empty set. position_crash signals won't fire (which is fine —
-  // those are for owned altcoins, addressed in étape 2C).
-  // The empty set returned here is also wrapped in a function so étape 2C
-  // can swap it for a real position tracker without touching the detector.
-  const heldSymbolsProvider = (): Set<string> => new Set<string>();
-  const detector = new Detector(ringBuffers, symbols, heldSymbolsProvider);
-  detector.start();
-
-  // 6. Tick handler — feeds buffers and detector
-  let totalTicks = 0;
-  const onTick = (tick: Tick): void => {
-    totalTicks++;
-    // Feed the ring buffer first (so the detector sees the new price)
-    ringBuffers.updateTick(tick.symbol, tick.price, tick.volume24h, tick.timestamp);
-    // Run detection (cheap gates, full classify only if a threshold crosses)
-    detector.evaluateTick(tick.symbol, tick.price, tick.volume24h);
-    // Heartbeat throttled to ≤1 write per 30s
-    void writeHeartbeat();
-    if (totalTicks % TICK_DEBUG_SAMPLE_RATE === 0) {
-      logger.debug("Tick sample", {
-        symbol: tick.symbol,
-        price: tick.price,
-        totalTicks,
-      });
-    }
-  };
-
-  // 7. Start WS
-  const stream = new CoinbaseTickerStream(productIds, onTick, apiKey, apiSecret);
-  stream.start();
-
-  // 8. HealthProvider that combines stream + buffers + detector stats
-  const healthProvider: HealthProvider = {
-    stats: () => stream.stats(),
-  };
-  const httpServer = startHealthServer(PORT, healthProvider);
-
-  // 9. Periodic stats log (every 5 min) — combined view
-  const statsTimer = setInterval(() => {
-    logger.info("Stats", {
-      stream: stream.stats(),
-      buffers: ringBuffers.stats(),
-      detector: detector.stats(),
-    });
-  }, STATS_LOG_INTERVAL_MS);
-
-  // 10. Periodic product refresh
-  const refreshTimer = setInterval(async () => {
-    try {
-      const fresh = await fetchTradableSymbols();
-      const added = [...fresh].filter(s => !symbols.has(s));
-      const removed = [...symbols].filter(s => !fresh.has(s));
-      if (added.length > 0 || removed.length > 0) {
-        // Update detector's universe (re-subscribe to WS deferred to a later step)
-        for (const s of added) symbols.add(s);
-        for (const s of removed) symbols.delete(s);
-        detector.setTradableSymbols(symbols);
-        logger.info("Product universe changed (detector universe updated, WS re-sub deferred)", {
-          added, removed, currentCount: symbols.size, freshCount: fresh.size,
-        });
-      } else {
-        logger.debug("Product universe unchanged", { count: symbols.size });
-      }
-    } catch (err) {
-      logger.warn("Product refresh failed", { err: (err as Error).message });
-    }
-  }, PRODUCT_REFRESH_INTERVAL_MS);
-
-  // 11. Graceful shutdown
-  const shutdown = (signal: string): void => {
-    logger.info("Shutting down", { signal });
-    clearInterval(statsTimer);
-    clearInterval(refreshTimer);
-    detector.stop();   // flushes pending logs
-    ringBuffers.stop();
-    stream.stop();
-    httpServer.close();
-    setTimeout(() => process.exit(0), 1_500);
-  };
-  process.on("SIGTERM", () => { shutdown("SIGTERM"); });
-  process.on("SIGINT", () => { shutdown("SIGINT"); });
-
-  process.on("uncaughtException", (err: Error) => {
-    logger.error("uncaughtException", { err: err.message, stack: err.stack });
-  });
-  process.on("unhandledRejection", (reason: unknown) => {
-    logger.error("unhandledRejection", { reason: String(reason) });
-  });
+interface AssetBuffers {
+  symbol: string;
+  currentPrice: number;
+  currentVolume24h: number;
+  // Short buffer — 5s granularity, 1h horizon. Used for 5m/15m/1h lookups.
+  shortBuffer: Float64Array;
+  shortHead: number;          // next write position
+  shortFilledCount: number;   // how many slots are filled (caps at SHORT_BUFFER_SIZE)
+  // Long buffer — 30s granularity, 4h horizon. Used for 4h lookup + 2h peak.
+  longBuffer: Float64Array;
+  longHead: number;
+  longFilledCount: number;
+  // Last update timestamp — for staleness checks
+  lastTickAt: number;
 }
 
-main().catch((err: Error) => {
-  logger.error("Fatal startup error", { err: err.message, stack: err.stack });
-  process.exit(1);
-});
+export interface PriceSnapshot {
+  currentPrice: number;
+  volume24h: number;
+  change5m: number | null;
+  change15m: number | null;
+  change30min: number | null;
+  change1h: number | null;
+  change4h: number | null;
+  // Drawdown from peak over 2h window. Null if not enough samples.
+  drawdownFromPeak: number;
+  peakSampleCount: number;
+}
+
+export class RingBuffers {
+  private buffers = new Map<string, AssetBuffers>();
+  private shortTimer: NodeJS.Timeout | null = null;
+  private longTimer: NodeJS.Timeout | null = null;
+  private snapshotsCount = 0;
+  private startedAt = 0;
+
+  /**
+   * Update the current price/volume for an asset on every tick.
+   * Allocates the buffer lazily on first observation.
+   */
+  updateTick(symbol: string, price: number, volume24h: number, timestamp: number): void {
+    let buf = this.buffers.get(symbol);
+    if (!buf) {
+      buf = {
+        symbol,
+        currentPrice: price,
+        currentVolume24h: volume24h,
+        shortBuffer: new Float64Array(SHORT_BUFFER_SIZE).fill(NaN),
+        shortHead: 0,
+        shortFilledCount: 0,
+        longBuffer: new Float64Array(LONG_BUFFER_SIZE).fill(NaN),
+        longHead: 0,
+        longFilledCount: 0,
+        lastTickAt: timestamp,
+      };
+      this.buffers.set(symbol, buf);
+    } else {
+      buf.currentPrice = price;
+      buf.currentVolume24h = volume24h;
+      buf.lastTickAt = timestamp;
+    }
+  }
+
+  /**
+   * Compute a price snapshot for an asset.
+   * Returns null if no tick has been observed for this symbol.
+   *
+   * change_n = (currentPrice - referencePrice_n) / referencePrice_n × 100
+   * referencePrice_n = price stored N slots before current head (or null if not filled)
+   */
+  getSnapshot(symbol: string): PriceSnapshot | null {
+    const buf = this.buffers.get(symbol);
+    if (!buf) return null;
+
+    const change5m = this.computeChange(buf, "short", SHORT_OFFSET_5M);
+    const change15m = this.computeChange(buf, "short", SHORT_OFFSET_15M);
+    const change30min = this.computeChange(buf, "short", SHORT_OFFSET_30M);
+    const change1h = this.computeChange(buf, "short", SHORT_OFFSET_1H);
+    const change4h = this.computeChange(buf, "long", LONG_OFFSET_4H);
+
+    // Drawdown from peak over the last 2h, using long buffer (30s granularity).
+    // We scan the last LONG_OFFSET_2H slots (or fewer if buffer not yet full)
+    // and find the max price observed.
+    const samplesToScan = Math.min(buf.longFilledCount, LONG_OFFSET_2H);
+    let peakPrice = buf.currentPrice;
+    let peakSampleCount = 0;
+    if (samplesToScan > 0) {
+      for (let i = 1; i <= samplesToScan; i++) {
+        // Walk backward from the most recent slot
+        const slotIdx = (buf.longHead - i + LONG_BUFFER_SIZE) % LONG_BUFFER_SIZE;
+        const v = buf.longBuffer[slotIdx];
+        if (!isNaN(v) && v > 0) {
+          peakSampleCount++;
+          if (v > peakPrice) peakPrice = v;
+        }
+      }
+    }
+    const drawdownFromPeak = peakPrice > 0
+      ? ((buf.currentPrice - peakPrice) / peakPrice) * 100
+      : 0;
+
+    return {
+      currentPrice: buf.currentPrice,
+      volume24h: buf.currentVolume24h,
+      change5m, change15m, change30min, change1h, change4h,
+      drawdownFromPeak,
+      peakSampleCount,
+    };
+  }
+
+  /**
+   * Returns the number of slots currently filled for diagnostic purposes.
+   * Useful to know "is this asset's history mature enough for filters?"
+   */
+  getFillStatus(symbol: string): { shortFilled: number; longFilled: number } | null {
+    const buf = this.buffers.get(symbol);
+    if (!buf) return null;
+    return { shortFilled: buf.shortFilledCount, longFilled: buf.longFilledCount };
+  }
+
+  /** Number of distinct assets being tracked. */
+  size(): number {
+    return this.buffers.size;
+  }
+
+  stats(): { assets: number; snapshotsTotal: number; uptimeMs: number } {
+    return {
+      assets: this.buffers.size,
+      snapshotsTotal: this.snapshotsCount,
+      uptimeMs: this.startedAt > 0 ? Date.now() - this.startedAt : 0,
+    };
+  }
+
+  start(): void {
+    this.startedAt = Date.now();
+    // Short buffer: snapshot every 5s
+    this.shortTimer = setInterval(() => {
+      for (const buf of this.buffers.values()) {
+        buf.shortBuffer[buf.shortHead] = buf.currentPrice;
+        buf.shortHead = (buf.shortHead + 1) % SHORT_BUFFER_SIZE;
+        if (buf.shortFilledCount < SHORT_BUFFER_SIZE) buf.shortFilledCount++;
+      }
+      this.snapshotsCount++;
+    }, SHORT_INTERVAL_MS);
+
+    // Long buffer: snapshot every 30s
+    this.longTimer = setInterval(() => {
+      for (const buf of this.buffers.values()) {
+        buf.longBuffer[buf.longHead] = buf.currentPrice;
+        buf.longHead = (buf.longHead + 1) % LONG_BUFFER_SIZE;
+        if (buf.longFilledCount < LONG_BUFFER_SIZE) buf.longFilledCount++;
+      }
+    }, LONG_INTERVAL_MS);
+
+    logger.info("RingBuffers started", {
+      shortIntervalMs: SHORT_INTERVAL_MS,
+      shortBufferSize: SHORT_BUFFER_SIZE,
+      longIntervalMs: LONG_INTERVAL_MS,
+      longBufferSize: LONG_BUFFER_SIZE,
+    });
+  }
+
+  stop(): void {
+    if (this.shortTimer) clearInterval(this.shortTimer);
+    if (this.longTimer) clearInterval(this.longTimer);
+    this.shortTimer = null;
+    this.longTimer = null;
+  }
+
+  /**
+   * Force one snapshot in the SHORT buffer for ALL tracked assets.
+   * Called by preload.ts to plant historical slots into the short buffer
+   * with proper temporal granularity (12 calls per scan snapshot = 60s).
+   */
+  takeShortSnapshotForPreload(): void {
+    for (const buf of this.buffers.values()) {
+      buf.shortBuffer[buf.shortHead] = buf.currentPrice;
+      buf.shortHead = (buf.shortHead + 1) % SHORT_BUFFER_SIZE;
+      if (buf.shortFilledCount < SHORT_BUFFER_SIZE) buf.shortFilledCount++;
+    }
+    this.snapshotsCount++;
+  }
+
+  /**
+   * Force one snapshot in the LONG buffer for ALL tracked assets.
+   * Called by preload.ts to plant historical slots into the long buffer
+   * with proper temporal granularity (2 calls per scan snapshot = 60s).
+   */
+  takeLongSnapshotForPreload(): void {
+    for (const buf of this.buffers.values()) {
+      buf.longBuffer[buf.longHead] = buf.currentPrice;
+      buf.longHead = (buf.longHead + 1) % LONG_BUFFER_SIZE;
+      if (buf.longFilledCount < LONG_BUFFER_SIZE) buf.longFilledCount++;
+    }
+  }
+
+  /**
+   * Compute the percent change between current price and the price stored
+   * `offset` slots before the current head in the requested buffer.
+   * Returns null if the buffer hasn't been filled enough (i.e. that offset
+   * slot is still NaN — asset was just listed or worker just started).
+   */
+  private computeChange(buf: AssetBuffers, kind: "short" | "long", offset: number): number | null {
+    const buffer = kind === "short" ? buf.shortBuffer : buf.longBuffer;
+    const head = kind === "short" ? buf.shortHead : buf.longHead;
+    const filledCount = kind === "short" ? buf.shortFilledCount : buf.longFilledCount;
+    const size = kind === "short" ? SHORT_BUFFER_SIZE : LONG_BUFFER_SIZE;
+
+    if (filledCount < offset) return null;
+    // Slot at `offset` positions back from head
+    const slotIdx = (head - offset + size) % size;
+    const refPrice = buffer[slotIdx];
+    if (isNaN(refPrice) || refPrice <= 0) return null;
+    return ((buf.currentPrice - refPrice) / refPrice) * 100;
+  }
+}

@@ -30,6 +30,7 @@ const LONG_BUFFER_SIZE = 480;          // 480 × 30s = 14400s = 4h
 // Lookup offsets in the short buffer (in slots)
 const SHORT_OFFSET_5M = Math.round((5 * 60_000) / SHORT_INTERVAL_MS);   // 60
 const SHORT_OFFSET_15M = Math.round((15 * 60_000) / SHORT_INTERVAL_MS); // 180
+const SHORT_OFFSET_30M = Math.round((30 * 60_000) / SHORT_INTERVAL_MS); // 360
 const SHORT_OFFSET_1H = Math.round((60 * 60_000) / SHORT_INTERVAL_MS);  // 720 (= full buffer)
 // Lookup offsets in the long buffer
 const LONG_OFFSET_4H = Math.round((4 * 60 * 60_000) / LONG_INTERVAL_MS); // 480 (= full buffer)
@@ -56,6 +57,7 @@ export interface PriceSnapshot {
   volume24h: number;
   change5m: number | null;
   change15m: number | null;
+  change30min: number | null;
   change1h: number | null;
   change4h: number | null;
   // Drawdown from peak over 2h window. Null if not enough samples.
@@ -110,6 +112,7 @@ export class RingBuffers {
 
     const change5m = this.computeChange(buf, "short", SHORT_OFFSET_5M);
     const change15m = this.computeChange(buf, "short", SHORT_OFFSET_15M);
+    const change30min = this.computeChange(buf, "short", SHORT_OFFSET_30M);
     const change1h = this.computeChange(buf, "short", SHORT_OFFSET_1H);
     const change4h = this.computeChange(buf, "long", LONG_OFFSET_4H);
 
@@ -137,7 +140,7 @@ export class RingBuffers {
     return {
       currentPrice: buf.currentPrice,
       volume24h: buf.currentVolume24h,
-      change5m, change15m, change1h, change4h,
+      change5m, change15m, change30min, change1h, change4h,
       drawdownFromPeak,
       peakSampleCount,
     };
