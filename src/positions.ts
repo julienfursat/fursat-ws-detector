@@ -9,7 +9,9 @@
 //   2. Read agent:trade_meta from Redis to get avgBuyPrice + buyTimestamp per symbol
 //   3. For each held altcoin (NOT BTC/ETH, NOT stables) with trade_meta entry,
 //      build an AgentPosition record
-//   4. Maintain a current snapshot accessible to the fast-exit evaluator
+//   4. Skip dust positions (valueUSD < DUST_THRESHOLD_USD) — these are residual
+//      balances after a SELL that Coinbase couldn't fully clear, not real positions
+//   5. Maintain a current snapshot accessible to the fast-exit evaluator
 //
 // We mirror scan.ts logic:
 //   - Multiple BUYs per symbol → keep the most RECENT buyTimestamp (simple heuristic;
@@ -33,6 +35,14 @@ const STABLES = new Set([
   "USDC", "USDT", "DAI", "BUSD", "TUSD", "USDP", "GUSD",
   "PYUSD", "FRAX", "LUSD", "SUSD", "EUR", "USD", "GBP", "EURS", "EURT",
 ]);
+
+// Positions worth less than this (in USD-equivalent) are considered dust —
+// residual balances from incomplete SELLs that Coinbase couldn't clear.
+// We don't surveil these because:
+//   1. fast-exit rules would compute nonsense PnL based on old avgBuyPrice
+//   2. SELL attempts on dust positions fail (amount below minimum trade size)
+//   3. They pollute logs and waste cooldown slots
+const DUST_THRESHOLD_USD = 5;
 
 export interface AgentPosition {
   symbol: string;
@@ -164,8 +174,9 @@ export class PositionsTracker {
         }
       }
 
-      // 3. Build the new positions map: held symbols ∩ has-trade-meta
+      // 3. Build the new positions map: held symbols ∩ has-trade-meta ∩ not-dust
       const newPositions = new Map<string, AgentPosition>();
+      let dustSkipped = 0;
       for (const [symbol, account] of accountsBySymbol.entries()) {
         const meta = metaBySymbol.get(symbol);
         if (!meta) continue; // legacy position, not surveilled by worker
@@ -173,6 +184,13 @@ export class PositionsTracker {
         // If first time we see this position, currentPrice = avgBuyPrice as placeholder.
         const prev = this.positions.get(symbol);
         const currentPrice = prev?.currentPrice ?? meta.avgBuyPrice;
+        const valueUSD = account.available * currentPrice;
+        // Skip dust positions — residual balances Coinbase couldn't clear after SELL.
+        // These would compute nonsense PnL against ancient avgBuyPrice.
+        if (valueUSD < DUST_THRESHOLD_USD) {
+          dustSkipped++;
+          continue;
+        }
         const pnlPct = ((currentPrice - meta.avgBuyPrice) / meta.avgBuyPrice) * 100;
         newPositions.set(symbol, {
           symbol,
@@ -181,7 +199,7 @@ export class PositionsTracker {
           avgBuyPrice: meta.avgBuyPrice,
           buyTimestamp: meta.buyTimestamp,
           pnlPct,
-          valueUSD: account.available * currentPrice,
+          valueUSD,
         });
       }
 
@@ -195,6 +213,7 @@ export class PositionsTracker {
         logger.info("Positions refreshed", {
           held: after,
           symbols: [...newPositions.keys()].sort().join(","),
+          dustSkipped,
         });
       }
     } catch (err) {
