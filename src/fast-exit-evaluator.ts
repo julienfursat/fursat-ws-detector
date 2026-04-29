@@ -54,6 +54,7 @@ export class FastExitEvaluator {
   private byReasonCode = {
     fast_stop_loss: 0,
     fast_partial_take: 0,
+    fast_no_pump_exit: 0,
     fast_ratchet: 0,
     fast_exit_on_green: 0,
     dead_position_exit: 0,

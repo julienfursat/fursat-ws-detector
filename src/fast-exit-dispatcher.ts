@@ -35,7 +35,7 @@ const MAX_LOG_ENTRIES = 1000;
 
 export interface FastExitDispatchPayload {
   symbol: string;
-  reasonCode: "fast_stop_loss" | "fast_ratchet" | "fast_exit_on_green" | "dead_position_exit" | "fast_partial_take";
+  reasonCode: "fast_stop_loss" | "fast_ratchet" | "fast_exit_on_green" | "dead_position_exit" | "fast_partial_take" | "fast_no_pump_exit";
   pnlPct: number;
   pnlMax?: number;
   pnlMin?: number;

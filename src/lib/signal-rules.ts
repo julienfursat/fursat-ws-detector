@@ -1,5 +1,3 @@
-// copie depuis fursat-net
-
 // ─────────────────────────────────────────────────────────────────────────────
 // signal-rules.ts — Module canonique des règles de détection et fast-exit
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +146,22 @@ export const FAST_EXIT_DEAD_MIN_AGE_MS = 45 * 60 * 1000;   // 45 min
 export const FAST_EXIT_DEAD_MAX_AGE_MS = 2 * 60 * 60 * 1000;  // 2h
 export const FAST_EXIT_DEAD_PNL_BAND = 3;       // |PnL| ≤ 3%
 export const FAST_EXIT_DEAD_CHANGE30M_BAND = 2; // |change30min| ≤ 2%
+
+// Rule 1.7 — Fast no-pump exit (NEW 2026-04-29)
+// Targets positions that were bought on a pump signal but the pump never materialized:
+// PnL_max never reached even +2%, position is in (slight) loss, and we've waited long enough
+// to be confident the pump is dead.
+// This fills the "dead zone" between fast_stop_loss (-10% threshold) and dead_position_exit
+// (±3% PnL band): a position drifting at -3% to -7% with no upward movement.
+// Trigger: age ∈ [30min, 90min] AND pnl_max < +2% AND PnL ≤ 0%
+// Rationale: with the WS worker dispatching fast, our detection is sub-minute. If a position
+// hasn't shown momentum within 30min of entry, it's a failed entry — cut losses early
+// rather than wait for fast_stop_loss at -10%.
+// Priority 1.7: between fast_partial_take (1.5) and fast_ratchet (2).
+export const FAST_EXIT_NO_PUMP_MIN_AGE_MS = 30 * 60 * 1000;   // 30 min
+export const FAST_EXIT_NO_PUMP_MAX_AGE_MS = 90 * 60 * 1000;   // 90 min (then dead_position_exit takes over from 45 to 120, with overlap)
+export const FAST_EXIT_NO_PUMP_PNL_MAX_THRESHOLD = 2;         // pnl_max < +2% = position never tried to pump
+export const FAST_EXIT_NO_PUMP_PNL_THRESHOLD = 0;             // PnL ≤ 0% = position is flat or in loss
 
 // ═════ CONSTANTES — ASSET CLASSIFICATION ═════════════════════════════════════
 
@@ -400,6 +414,7 @@ export function classifySignal(input: ClassifyInput): ClassifyResult {
 export type FastExitReason =
   | "fast_stop_loss"
   | "fast_partial_take"
+  | "fast_no_pump_exit"
   | "fast_ratchet"
   | "fast_exit_on_green"
   | "dead_position_exit";
@@ -435,6 +450,7 @@ export interface FastExitVerdict {
  * Priority order (mirrors scan.ts §0.5):
  *   1.   fast_stop_loss      (change1h < -8% AND PnL ≤ -10%)
  *   1.5  fast_partial_take   (PnL ≥ +12% AND not partial-taken)
+ *   1.7  fast_no_pump_exit   (age ∈ [30min,90min] AND pnl_max < +2% AND PnL ≤ 0%)
  *   2.   fast_ratchet        (PnL_max ≥ +8% AND PnL ≤ PnL_max - drawdown_pts)
  *   3.   fast_exit_on_green  (PnL ≥ +1% AND PnL_min ≤ -2% AND age ≥ 24h AND value ≥ $50)
  *   4.   dead_position_exit  (age ∈ [45min,2h] AND |PnL| ≤ 3% AND |change30min| ≤ 2%)
@@ -463,6 +479,17 @@ export function evaluateFastExitRules(
       sellRatio: FAST_PARTIAL_TAKE_RATIO,
       change1h, change15m, change30min,
     };
+  }
+
+  // Rule 1.7: FAST NO-PUMP EXIT — position never showed momentum, exit early
+  // Fills the dead zone between fast_stop_loss (-10%) and dead_position_exit (±3% band).
+  // If pnl_max never crossed +2% within 30-90min and we're flat-or-losing, the entry failed.
+  if (pnlMax !== undefined
+      && pnlMax < FAST_EXIT_NO_PUMP_PNL_MAX_THRESHOLD
+      && position.pnlPct <= FAST_EXIT_NO_PUMP_PNL_THRESHOLD
+      && ageMs >= FAST_EXIT_NO_PUMP_MIN_AGE_MS
+      && ageMs <= FAST_EXIT_NO_PUMP_MAX_AGE_MS) {
+    return { reasonCode: "fast_no_pump_exit", priority: 1.7, change1h, change15m, change30min };
   }
 
   // Rule 2: FAST RATCHET — asymmetric drawdown threshold
