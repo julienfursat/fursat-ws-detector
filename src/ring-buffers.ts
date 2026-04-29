@@ -203,6 +203,25 @@ export class RingBuffers {
   }
 
   /**
+   * Force one snapshot in BOTH short and long buffers for ALL tracked assets.
+   * Called by preload.ts to plant historical snapshots into the buffers.
+   * Bypasses the timer-based snapshotting — used during warm-start only.
+   */
+  takeSnapshotForPreload(): void {
+    for (const buf of this.buffers.values()) {
+      // Short buffer slot
+      buf.shortBuffer[buf.shortHead] = buf.currentPrice;
+      buf.shortHead = (buf.shortHead + 1) % SHORT_BUFFER_SIZE;
+      if (buf.shortFilledCount < SHORT_BUFFER_SIZE) buf.shortFilledCount++;
+      // Long buffer slot
+      buf.longBuffer[buf.longHead] = buf.currentPrice;
+      buf.longHead = (buf.longHead + 1) % LONG_BUFFER_SIZE;
+      if (buf.longFilledCount < LONG_BUFFER_SIZE) buf.longFilledCount++;
+    }
+    this.snapshotsCount++;
+  }
+
+  /**
    * Compute the percent change between current price and the price stored
    * `offset` slots before the current head in the requested buffer.
    * Returns null if the buffer hasn't been filled enough (i.e. that offset

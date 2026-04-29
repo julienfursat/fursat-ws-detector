@@ -1,26 +1,26 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// index.ts — fursat-ws-detector entry point (étape 2A)
+// index.ts — fursat-ws-detector entry point (étape 2B)
 // ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap sequence:
 //   1. Fetch tradable *-USDC products from Coinbase REST
 //   2. Apply optional SYMBOL_OVERRIDE filter (testing)
 //   3. Verify Coinbase credentials (required for WS auth)
 //   4. Start ring buffers (5m/15m/1h/4h history)
-//   5. Start detector (event-driven on every tick)
-//   6. Start the Coinbase ticker WS stream
-//   7. Start the HTTP health server with combined stats
-//   8. Periodic stats log + product refresh
-//   9. Graceful shutdown handlers
+//   5. PRELOAD ring buffers from scan:price_snapshots (warm start)
+//   6. Start detector (event-driven on every tick)
+//   7. Start the Coinbase ticker WS stream
+//   8. Start the HTTP health server
+//   9. Periodic stats log + product refresh
+//  10. Graceful shutdown handlers
 //
-// Étape 2A behavior:
+// Étape 2B behavior:
 //   • Receives ticks → updates ring buffers → invokes detector
-//   • Detector classifies signals via signal-rules.ts (LOG ONLY)
-//   • Logs signals to Redis: worker:detected_signals_log, worker:filtered_signals_log
-//   • NO HTTP dispatch to fursat.net entry yet (that's étape 2B)
-//   • NO position polling or fast-exit yet (that's étape 2C)
-//
-// At this stage, scan.ts on fursat.net continues to run and dispatch as before.
-// The worker runs in shadow mode for comparison.
+//   • Detector classifies signals → for alt_pump candidates only:
+//     - Pre-checks (throttle, blacklist)
+//     - Dispatches to fursat.net /api/agent/entry
+//   • Logs all detections in dryrun:detected_signals_log
+//   • Logs all dispatches in worker:dispatches_log
+//   • scan.ts continues to run as a safety net (shared throttle prevents double dispatch)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { logger } from "./logger.js";
@@ -30,6 +30,7 @@ import { startHealthServer, type HealthProvider } from "./health-server.js";
 import { writeHeartbeat } from "./redis.js";
 import { RingBuffers } from "./ring-buffers.js";
 import { Detector } from "./detector.js";
+import { preloadRingBuffers } from "./preload.js";
 
 const PORT = parseInt(process.env.PORT ?? "8080", 10);
 const PRODUCT_REFRESH_INTERVAL_MS = 60 * 60_000;  // refresh products every hour
@@ -37,7 +38,7 @@ const STATS_LOG_INTERVAL_MS = 5 * 60_000;          // log stats every 5 min
 const TICK_DEBUG_SAMPLE_RATE = 50_000;             // log 1 tick out of N at debug
 
 async function main(): Promise<void> {
-  logger.info("Starting fursat-ws-detector (étape 2A — detection in log-only mode)", {
+  logger.info("Starting fursat-ws-detector (étape 2B — ring buffers + dispatch)", {
     nodeVersion: process.version,
     port: PORT,
     logLevel: process.env.LOG_LEVEL ?? "info",
@@ -67,8 +68,12 @@ async function main(): Promise<void> {
   const ringBuffers = new RingBuffers();
   ringBuffers.start();
 
-  // 5. Detector
-  // heldSymbolsProvider: at étape 2A we don't poll positions yet, so always
+  // 5. Preload from scan:price_snapshots (warm start — avoids 1h cold-start
+  // window where change1h is null and most signals are filtered)
+  await preloadRingBuffers(ringBuffers, symbols);
+
+  // 6. Detector
+  // heldSymbolsProvider: at étape 2B we don't poll positions yet, so always
   // return an empty set. position_crash signals won't fire (which is fine —
   // those are for owned altcoins, addressed in étape 2C).
   // The empty set returned here is also wrapped in a function so étape 2C

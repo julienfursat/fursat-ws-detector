@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// detector.ts — Event-driven signal detection on every tick
+// detector.ts — Event-driven signal detection + dispatch (étape 2B)
 // ─────────────────────────────────────────────────────────────────────────────
 // Called on every tick (~290/sec aggregated). Most ticks don't pump enough to
 // warrant the full classify path, so we apply cheap "gates" first and only
@@ -11,21 +11,26 @@
 //   3. At least one of {change5m, change15m, change1h} must be ≥ its WEAK
 //      threshold — anything below that won't classify anyway
 //
-// If gate passes → invoke classifySignal() → either get a candidate (logged
-// as detected) or get a skip reason (logged as filtered for diagnostic).
+// If gate passes → invoke classifySignal() → either get a candidate or a skip
+// reason (logged in dryrun:filtered_signals_log).
 //
-// Logging strategy:
-//   • All candidates → worker:detected_signals_log (Redis list, capped at 1000)
-//   • All filtered signals → worker:filtered_signals_log (capped at 1000)
-//   • Console logs only at DEBUG level
+// Étape 2B — DISPATCH PATH (alt_pump candidates only):
+//   1. Pre-checks (asynchronous):
+//      • throttle.checkThrottle(symbol)   — shared with scan.ts
+//      • blacklist.isBlacklisted(symbol)  — read-only from agent:entry_blacklist
+//   2. If both pass → dispatcher.dispatchEntry(signal)
+//      Dispatch goes to fursat.net /api/agent/entry with same headers/body as scan.ts
 //
-// At étape 2A we LOG ONLY. No dispatch, no Redis write to scan:dispatched_assets.
-// Étape 2B will add the dispatch path.
+// Other signal types (major_crash, position_crash, major_pump) are LOGGED ONLY
+// in 2B — these need MANAGE involvement which we'll re-evaluate later (BACKLOG-2).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { logger } from "./logger.js";
 import { redisGet, redisSet } from "./redis.js";
 import { RingBuffers } from "./ring-buffers.js";
+import { checkThrottle } from "./throttle.js";
+import { isBlacklisted } from "./blacklist.js";
+import { dispatchEntry, type DispatchSignal } from "./dispatcher.js";
 import {
   classifySignal,
   STABLES,
@@ -93,6 +98,20 @@ export class Detector {
   private signalsFiltered = 0;
   private bySignalType = { alt_pump: 0, major_crash: 0, position_crash: 0, major_pump: 0 };
   private byTriggerSource = { "5m": 0, "15m": 0, "1h": 0, none: 0 };
+
+  // Étape 2B dispatch counters
+  private dispatchAttempted = 0;
+  private dispatchOk = 0;
+  private dispatchSkipped = 0;
+  private dispatchHttpError = 0;
+  private dispatchNetworkError = 0;
+  private dispatchPreCheckFailed = { throttle: 0, blacklist: 0 };
+
+  // In-flight guard: prevents re-triggering dispatch on the same symbol while
+  // a previous dispatch is still in progress. The throttle in Redis catches
+  // the re-trigger eventually, but the in-flight guard saves Redis round-trips
+  // when a fast pump generates 10+ ticks per second on the same asset.
+  private inFlightDispatches = new Set<string>();
 
   constructor(
     ringBuffers: RingBuffers,
@@ -194,6 +213,13 @@ export class Detector {
         drawdown: snap.drawdownFromPeak.toFixed(1),
         held: isHeld,
       });
+
+      // Étape 2B: dispatch alt_pump candidates only.
+      // Other signal types (major_crash, position_crash, major_pump) need
+      // MANAGE involvement and are logged-only for now.
+      if (result.candidate.signalType === "alt_pump") {
+        void this.tryDispatch(result.candidate);
+      }
     } else if (result.reason !== "no_signal") {
       this.signalsFiltered++;
       this.recordFiltered(now, symbol, result.reason, snap);
@@ -228,6 +254,15 @@ export class Detector {
     signalsFiltered: number;
     bySignalType: { alt_pump: number; major_crash: number; position_crash: number; major_pump: number };
     byTriggerSource: { "5m": number; "15m": number; "1h": number; none: number };
+    dispatch: {
+      attempted: number;
+      ok: number;
+      skipped: number;
+      httpError: number;
+      networkError: number;
+      preCheckFailed: { throttle: number; blacklist: number };
+      inFlight: number;
+    };
     pendingDetected: number;
     pendingFiltered: number;
   } {
@@ -239,9 +274,83 @@ export class Detector {
       signalsFiltered: this.signalsFiltered,
       bySignalType: this.bySignalType,
       byTriggerSource: this.byTriggerSource,
+      dispatch: {
+        attempted: this.dispatchAttempted,
+        ok: this.dispatchOk,
+        skipped: this.dispatchSkipped,
+        httpError: this.dispatchHttpError,
+        networkError: this.dispatchNetworkError,
+        preCheckFailed: this.dispatchPreCheckFailed,
+        inFlight: this.inFlightDispatches.size,
+      },
       pendingDetected: this.pendingDetected.length,
       pendingFiltered: this.pendingFiltered.length,
     };
+  }
+
+  /**
+   * Try to dispatch an alt_pump candidate to fursat.net.
+   * Pre-checks: in-flight guard, throttle, blacklist.
+   * Fire-and-forget — caller doesn't await.
+   */
+  private async tryDispatch(c: MomentumCandidate): Promise<void> {
+    const symbol = c.symbol;
+
+    // Cheap in-memory guard: if a dispatch is already in-flight for this
+    // symbol, skip silently. Prevents 50 dispatch attempts in 1s on a fast pump.
+    if (this.inFlightDispatches.has(symbol)) return;
+    this.inFlightDispatches.add(symbol);
+
+    try {
+      // Pre-check 1: throttle (shared with scan.ts)
+      const throttleCheck = await checkThrottle(symbol);
+      if (!throttleCheck.allowed) {
+        this.dispatchPreCheckFailed.throttle++;
+        logger.info("Dispatch SKIPPED — throttled", {
+          symbol, reason: throttleCheck.reason, details: throttleCheck.details,
+        });
+        return;
+      }
+
+      // Pre-check 2: blacklist
+      const blacklistCheck = await isBlacklisted(symbol);
+      if (blacklistCheck.blacklisted) {
+        this.dispatchPreCheckFailed.blacklist++;
+        logger.info("Dispatch SKIPPED — blacklisted", {
+          symbol,
+          reason: blacklistCheck.reason,
+          expiresInMs: blacklistCheck.expiresInMs,
+        });
+        return;
+      }
+
+      // All checks passed — dispatch
+      this.dispatchAttempted++;
+      const signal: DispatchSignal = {
+        symbol,
+        change5m: c.change5m,
+        change15m: c.change15m,
+        change1h: c.change1h,
+        change24h: c.change24h,
+        volume24h: c.volume24h,
+        drawdownFromPeak: c.drawdownFromPeak,
+        severity: c.severity,
+        signalType: c.signalType,
+        triggerSource: c.triggerSource,
+        signalPrice: c.currentPrice,
+        signalTimestamp: Date.now(),
+      };
+      const result = await dispatchEntry(signal);
+
+      if (result.ok) this.dispatchOk++;
+      else if (result.skipped) this.dispatchSkipped++;
+      else if (result.error) this.dispatchNetworkError++;
+      else this.dispatchHttpError++;
+    } catch (err) {
+      logger.error("tryDispatch threw", { symbol, err: (err as Error).message });
+    } finally {
+      this.inFlightDispatches.delete(symbol);
+    }
   }
 
   private recordDetected(ts: number, c: MomentumCandidate): void {
