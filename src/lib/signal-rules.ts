@@ -86,6 +86,32 @@ export const MATURE_PUMP_MAX_RATIO = 0.3;        // change15m / change1h < 0.3 �
 export const AMPLITUDE_MIN_1H_PCT_STRONG = 8;        // STRONG needs change1h ≥ 8% as one validation path
 export const AMPLITUDE_MIN_5M_PCT_STRONG = 6;        // OR change5m ≥ 6% (very strong micro-burst)
 
+// ═════ FAST-PATH SUB-MINUTE — LOG-ONLY OBSERVATION (NEW 2026-04-30) ══════════
+// BACKLOG-3 étape 1 : observation des candidats fast-path basés sur change1min,
+// pour calibrer empiriquement Y_STRONG, Y_MAJOR (déclenchement) et X_MIN (filtre)
+// avant d'activer en production.
+//
+// ATTENTION — Ces seuils sont des VALEURS NOMINALES initiales, PAS calibrées.
+// Ils servent à logger des candidats hypothétiques pour 24-48h d'observation.
+// Ne pas les utiliser pour activer un déclenchement réel sans calibration.
+//
+// Logique nominale :
+//   Y_STRONG = +2.0% sur change1min  → fast-path STRONG candidat
+//   Y_MAJOR  = +3.5% sur change1min  → fast-path MAJOR candidat
+//   X_MIN    = +0.3% sur change1min  → veto "pump mort" sur signaux STRONG/MAJOR classiques
+//
+// Pré-conditions communes au déclenchement :
+//   - volume24h >= $1M (pas de nano-cap)
+//   - change5m < 4% (pump pas encore "mature")
+//   - change1h > -3% (pas de rebond après dump)
+//   - !isHeld (pas déjà détenu)
+export const FASTPATH_LOG_STRONG_CHANGE1MIN = 2.0;
+export const FASTPATH_LOG_MAJOR_CHANGE1MIN = 3.5;
+export const FASTPATH_LOG_FILTER_DEAD_CHANGE1MIN = 0.3;
+export const FASTPATH_LOG_MIN_VOLUME_24H = 1_000_000;
+export const FASTPATH_LOG_MAX_CHANGE5M = 4.0;
+export const FASTPATH_LOG_MIN_CHANGE1H = -3.0;
+
 // ═════ CONSTANTES — SEUILS DE CRASH / MAJORS ═════════════════════════════════
 
 // Crash thresholds on open positions (altcoins held in portfolio)
@@ -552,4 +578,83 @@ export function evaluateFastExitRules(
   }
 
   return null;
+}
+
+// ═════ FAST-PATH SUB-MINUTE EVALUATION (LOG-ONLY, fonction pure) ═════════════
+// BACKLOG-3 étape 1 (2026-04-30) — observation des candidats sub-minute pour
+// calibration empirique avant activation. Voir constantes FASTPATH_LOG_* en
+// haut du fichier pour les seuils nominaux et la logique.
+
+export interface FastPathCandidate {
+  /** Le signal aurait déclenché un fast-path STRONG (change1min ≥ FASTPATH_LOG_STRONG_CHANGE1MIN) */
+  wouldFireStrong: boolean;
+  /** Le signal aurait déclenché un fast-path MAJOR (change1min ≥ FASTPATH_LOG_MAJOR_CHANGE1MIN) */
+  wouldFireMajor: boolean;
+  /** Le signal classique STRONG/MAJOR aurait été filtré comme "pump mort" (change1min < FASTPATH_LOG_FILTER_DEAD_CHANGE1MIN) */
+  wouldFilterDead: boolean;
+  /** Tags explicatifs pour le log (debug/calibration) */
+  reasons: string[];
+}
+
+/**
+ * Évalue les candidats fast-path en mode LOG-ONLY.
+ *
+ * NE DÉCLENCHE RIEN. Cette fonction calcule uniquement ce qui SE SERAIT PASSÉ
+ * si un système fast-path sub-minute était actif. Le résultat doit être loggé
+ * (par exemple dans `dryrun:fastpath_log`) pour calibration empirique sur 24-48h.
+ *
+ * Fonction pure — pas d'I/O, pas de Redis, pas de fetch.
+ *
+ * Trois verdicts indépendants :
+ *   - wouldFireStrong / wouldFireMajor : déclenchement hypothétique sur change1min
+ *     ≥ seuil, sous réserve de pré-conditions (volume, pump non-mature, pas de
+ *     rebond post-dump, pas déjà détenu).
+ *   - wouldFilterDead : signal classique STRONG/MAJOR qui aurait été rejeté car
+ *     change1min sous le seuil de vélocité minimum (pump déjà mort au dispatch).
+ *
+ * @param candidate Le candidat issu de classifySignal() — contient déjà change1min etc.
+ * @returns Verdict avec les trois flags + tags explicatifs.
+ */
+export function evaluateFastPathCandidate(candidate: MomentumCandidate): FastPathCandidate {
+  const { change1min, change5m, change1h, volume24h, isHeld, severity } = candidate;
+  const reasons: string[] = [];
+  let wouldFireStrong = false;
+  let wouldFireMajor = false;
+  let wouldFilterDead = false;
+
+  // ─── Branche déclenchement STRONG/MAJOR (toutes pré-conditions doivent être vraies) ───
+  if (change1min === null) {
+    reasons.push("no_change1min");
+  } else if (volume24h < FASTPATH_LOG_MIN_VOLUME_24H) {
+    reasons.push("low_volume24h");
+  } else if (change5m !== null && change5m >= FASTPATH_LOG_MAX_CHANGE5M) {
+    reasons.push("pump_mature_5m");
+  } else if (change1h !== null && change1h <= FASTPATH_LOG_MIN_CHANGE1H) {
+    reasons.push("dead_cat_bounce");
+  } else if (isHeld) {
+    reasons.push("already_held");
+  } else if (change1min >= FASTPATH_LOG_MAJOR_CHANGE1MIN) {
+    wouldFireMajor = true;
+    wouldFireStrong = true;
+    reasons.push(`fire_major:c1m=${change1min.toFixed(2)}%`);
+  } else if (change1min >= FASTPATH_LOG_STRONG_CHANGE1MIN) {
+    wouldFireStrong = true;
+    reasons.push(`fire_strong:c1m=${change1min.toFixed(2)}%`);
+  } else {
+    reasons.push(`below_strong:c1m=${change1min.toFixed(2)}%`);
+  }
+
+  // ─── Branche filtre "pump mort" (indépendante) ───
+  // S'applique aux signaux classiques STRONG/MAJOR : si change1min est sous le seuil
+  // de vélocité minimum, le pump est probablement déjà mort au moment du dispatch.
+  if (
+    (severity === "strong" || severity === "major")
+    && change1min !== null
+    && change1min < FASTPATH_LOG_FILTER_DEAD_CHANGE1MIN
+  ) {
+    wouldFilterDead = true;
+    reasons.push(`filter_dead:c1m=${change1min.toFixed(2)}%`);
+  }
+
+  return { wouldFireStrong, wouldFireMajor, wouldFilterDead, reasons };
 }
