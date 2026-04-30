@@ -33,6 +33,7 @@ import { isBlacklisted } from "./blacklist.js";
 import { dispatchEntry, type DispatchSignal } from "./dispatcher.js";
 import {
   classifySignal,
+  evaluateFastPathCandidate,
   STABLES,
   MAJORS,
   type ClassifyInput,
@@ -50,6 +51,7 @@ import {
 // Use dryrun:* prefix so the assertDryrunKey guard in redis.ts allows the writes.
 const DETECTED_LOG_KEY = "dryrun:detected_signals_log";
 const FILTERED_LOG_KEY = "dryrun:filtered_signals_log";
+const FASTPATH_LOG_KEY = "dryrun:fastpath_log";  // BACKLOG-3 phase 1, log-only fast-path observation
 const MAX_LOG_ENTRIES = 1000;
 
 // In-memory log buffers (flushed to Redis on a timer for efficiency).
@@ -85,6 +87,36 @@ interface FilteredEntry {
   change1h: number | null;
 }
 
+// BACKLOG-3 phase 1 (2026-04-30) — log-only fast-path candidate observation.
+// One entry per detected signal (alongside DetectedEntry), recording what the
+// hypothetical fast-path system WOULD have done. Used for empirical calibration
+// of Y_STRONG, Y_MAJOR, X_MIN before activating real fast-path triggers.
+interface FastPathEntry {
+  ts: number;
+  symbol: string;
+  // Sub-minute windows (the variables we want to calibrate)
+  change30s: number | null;
+  change1min: number | null;
+  change2min: number | null;
+  // Surrounding context for cross-checking calibration
+  change5m: number | null;
+  change15m: number | null;
+  change1h: number | null;
+  change4h: number | null;
+  volume24h: number;
+  drawdownFromPeak: number;
+  isHeld: boolean;
+  // Classical signal that triggered this observation
+  classicalSeverity: "weak" | "strong" | "major";
+  classicalSignalType: string;
+  classicalTriggerSource: string | null;
+  // Fast-path verdict (log-only)
+  wouldFireStrong: boolean;
+  wouldFireMajor: boolean;
+  wouldFilterDead: boolean;
+  reasons: string[];
+}
+
 export class Detector {
   private ringBuffers: RingBuffers;
   private tradableSymbols: Set<string>;
@@ -94,6 +126,7 @@ export class Detector {
   // Pending log entries (flushed every FLUSH_INTERVAL_MS)
   private pendingDetected: DetectedEntry[] = [];
   private pendingFiltered: FilteredEntry[] = [];
+  private pendingFastPath: FastPathEntry[] = [];  // BACKLOG-3 phase 1
 
   // Counters surfaced via stats()
   private ticksEvaluated = 0;
@@ -210,6 +243,11 @@ export class Detector {
       const sev = result.candidate.severity as keyof typeof this.bySeverity;
       this.bySeverity[sev]++;
       this.recordDetected(now, result.candidate);
+
+      // BACKLOG-3 phase 1: log-only fast-path evaluation. Pure function, no I/O,
+      // result buffered for periodic flush along with detected/filtered logs.
+      this.recordFastPath(now, result.candidate);
+
       logger.info("⚡ SIGNAL DETECTED", {
         symbol,
         type: result.candidate.signalType,
@@ -280,6 +318,7 @@ export class Detector {
     };
     pendingDetected: number;
     pendingFiltered: number;
+    pendingFastPath: number;
   } {
     return {
       tradableUniverse: this.tradableSymbols.size,
@@ -301,6 +340,7 @@ export class Detector {
       },
       pendingDetected: this.pendingDetected.length,
       pendingFiltered: this.pendingFiltered.length,
+      pendingFastPath: this.pendingFastPath.length,
     };
   }
 
@@ -401,6 +441,36 @@ export class Detector {
   }
 
   /**
+   * BACKLOG-3 phase 1 — log-only fast-path observation.
+   * Calls the pure evaluator from signal-rules.ts and buffers the result
+   * for periodic flush. Triggers ZERO real action.
+   */
+  private recordFastPath(ts: number, c: MomentumCandidate): void {
+    const verdict = evaluateFastPathCandidate(c);
+    this.pendingFastPath.push({
+      ts,
+      symbol: c.symbol,
+      change30s: c.change30s,
+      change1min: c.change1min,
+      change2min: c.change2min,
+      change5m: c.change5m,
+      change15m: c.change15m,
+      change1h: c.change1h,
+      change4h: c.change4h,
+      volume24h: c.volume24h,
+      drawdownFromPeak: c.drawdownFromPeak,
+      isHeld: c.isHeld,
+      classicalSeverity: c.severity,
+      classicalSignalType: c.signalType,
+      classicalTriggerSource: c.triggerSource,
+      wouldFireStrong: verdict.wouldFireStrong,
+      wouldFireMajor: verdict.wouldFireMajor,
+      wouldFilterDead: verdict.wouldFilterDead,
+      reasons: verdict.reasons,
+    });
+  }
+
+  /**
    * Flush pending log entries to Redis, prepending to the existing list and
    * truncating at MAX_LOG_ENTRIES. Done periodically rather than per-event
    * to amortize Redis cost on bursty pump waves.
@@ -408,6 +478,7 @@ export class Detector {
   private async flushLogs(): Promise<void> {
     const detectedToFlush = this.pendingDetected.splice(0);
     const filteredToFlush = this.pendingFiltered.splice(0);
+    const fastPathToFlush = this.pendingFastPath.splice(0);
 
     if (detectedToFlush.length > 0) {
       try {
@@ -429,6 +500,18 @@ export class Detector {
       } catch (err) {
         logger.warn("Failed to flush filtered log", { err: (err as Error).message });
         this.pendingFiltered.unshift(...filteredToFlush);
+      }
+    }
+
+    // BACKLOG-3 phase 1 — flush fast-path observation log
+    if (fastPathToFlush.length > 0) {
+      try {
+        const existing: FastPathEntry[] = (await redisGet<FastPathEntry[]>(FASTPATH_LOG_KEY)) ?? [];
+        const merged = [...fastPathToFlush, ...existing].slice(0, MAX_LOG_ENTRIES);
+        await redisSet(FASTPATH_LOG_KEY, merged);
+      } catch (err) {
+        logger.warn("Failed to flush fastpath log", { err: (err as Error).message });
+        this.pendingFastPath.unshift(...fastPathToFlush);
       }
     }
   }
