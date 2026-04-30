@@ -123,7 +123,17 @@ export const MIN_SIGNAL_VOLUME_USD = 500_000;
 export const FAST_EXIT_STOP_LOSS_CHANGE1H = -8;
 export const FAST_EXIT_STOP_LOSS_PNL = -10;
 export const FAST_PARTIAL_TAKE_PNL = 12;          // PnL ≥ +12% triggers partial take
-export const FAST_PARTIAL_TAKE_RATIO = 0.5;       // SELL 50% of available
+export const FAST_PARTIAL_TAKE_RATIO = 0.5;       // SELL 50% of available (legacy default)
+// 2026-04-30: Dynamic partial-take ratio — adapt to pnlPct at trigger time.
+// On explosive pumps where pnlPct ≥ +20% when partial fires (rare with old fenetres,
+// expected to become common with sub-minute detection), we lock in MORE of the gain
+// because the pump is likely near peak. The remaining 25% is still under ratchet
+// protection in case the pump continues higher.
+// Examples observed nuit du 30/04:
+//   L3 #1: partial fired at pnlPct=28.25% → with new logic, 75% sold = $87 secured (vs $58 with 50%).
+//   IDEX: partial fired at pnlPct=14.5% → unchanged, 50% sold (pump still active).
+export const FAST_PARTIAL_TAKE_EXPLOSIVE_PNL_THRESHOLD = 20;  // pnlPct ≥ this → switch to higher ratio
+export const FAST_PARTIAL_TAKE_RATIO_EXPLOSIVE = 0.75;        // SELL 75% on explosive pumps
 export const FAST_EXIT_RATCHET_PNL_MAX_TRIGGER = 8;
 export const FAST_EXIT_RATCHET_DRAWDOWN_PTS_LOW = 3;     // pnl_max < 15 → drawdown 3 pts
 export const FAST_EXIT_RATCHET_DRAWDOWN_PTS_HIGH = 5;    // pnl_max ≥ 15 → drawdown 5 pts
@@ -173,6 +183,10 @@ export const MAJORS = new Set(["BTC", "ETH"]);
 export interface MomentumCandidate {
   symbol: string;
   currentPrice: number;
+  // Sub-minute observability windows (NEW 2026-04-30 — log-only for BACKLOG-3 phase A)
+  change30s: number | null;
+  change1min: number | null;
+  change2min: number | null;
   change5m: number | null;
   change15m: number | null;
   change1h: number | null;
@@ -212,6 +226,12 @@ export interface AgentPosition {
 export interface ClassifyInput {
   symbol: string;
   currentPrice: number;
+  // Sub-minute observability windows (NEW 2026-04-30 — log-only for BACKLOG-3 phase A)
+  // Optional because scan.ts (polling 1min) cannot compute these — only the WS worker can.
+  // When absent, candidates will have null values for these fields (no impact on classification).
+  change30s?: number | null;
+  change1min?: number | null;
+  change2min?: number | null;
   change5m: number | null;
   change15m: number | null;
   change1h: number | null;
@@ -283,9 +303,15 @@ export type ClassifyResult =
  */
 export function classifySignal(input: ClassifyInput): ClassifyResult {
   const {
-    symbol, currentPrice, change5m, change15m, change1h, change4h, change24h,
+    symbol, currentPrice,
+    change5m, change15m, change1h, change4h, change24h,
     volume24h, isHeld, isMajor, drawdownFromPeak, peakSampleCount,
   } = input;
+  // Optional sub-minute fields — default to null if caller didn't provide them
+  // (e.g. scan.ts polling 1min has no access to sub-minute granularity).
+  const change30s = input.change30s ?? null;
+  const change1min = input.change1min ?? null;
+  const change2min = input.change2min ?? null;
 
   // Drawdown guard threshold depends on how many samples we have in the 2h peak window.
   // < 3 samples → no guard (not enough data); 3-5 samples → -3%; ≥ 6 samples → -1.5%.
@@ -401,6 +427,7 @@ export function classifySignal(input: ClassifyInput): ClassifyResult {
 
   const candidate: MomentumCandidate = {
     symbol, currentPrice,
+    change30s, change1min, change2min,
     change5m, change15m, change1h, change4h, change24h,
     volume24h,
     score, signalType, severity, isHeld,
@@ -473,10 +500,15 @@ export function evaluateFastExitRules(
   }
 
   // Rule 1.5: FAST PARTIAL TAKE — preemptive at +12%, before ratchet
+  // Dynamic ratio (2026-04-30): on explosive pumps (pnlPct ≥ +20% at trigger), lock in 75%
+  // instead of 50% — the pump is likely near peak and we want to secure more profit.
   if (position.pnlPct >= FAST_PARTIAL_TAKE_PNL && !partialTaken) {
+    const sellRatio = position.pnlPct >= FAST_PARTIAL_TAKE_EXPLOSIVE_PNL_THRESHOLD
+      ? FAST_PARTIAL_TAKE_RATIO_EXPLOSIVE
+      : FAST_PARTIAL_TAKE_RATIO;
     return {
       reasonCode: "fast_partial_take", priority: 1.5,
-      sellRatio: FAST_PARTIAL_TAKE_RATIO,
+      sellRatio,
       change1h, change15m, change30min,
     };
   }

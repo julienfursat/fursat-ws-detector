@@ -63,6 +63,10 @@ interface DetectedEntry {
   signalType: string;
   severity: string;
   triggerSource: string | null;
+  // Sub-minute observability windows (NEW 2026-04-30 — log-only, BACKLOG-3 phase A)
+  change30s: number | null;
+  change1min: number | null;
+  change2min: number | null;
   change5m: number | null;
   change15m: number | null;
   change1h: number | null;
@@ -98,6 +102,7 @@ export class Detector {
   private signalsFiltered = 0;
   private bySignalType = { alt_pump: 0, major_crash: 0, position_crash: 0, major_pump: 0 };
   private byTriggerSource = { "5m": 0, "15m": 0, "1h": 0, none: 0 };
+  private bySeverity = { weak: 0, strong: 0, major: 0 };
 
   // Étape 2B dispatch counters
   private dispatchAttempted = 0;
@@ -175,6 +180,9 @@ export class Detector {
     const input: ClassifyInput = {
       symbol,
       currentPrice: snap.currentPrice,
+      change30s: snap.change30s,
+      change1min: snap.change1min,
+      change2min: snap.change2min,
       change5m: snap.change5m,
       change15m: snap.change15m,
       change1h: snap.change1h,
@@ -199,6 +207,8 @@ export class Detector {
       this.bySignalType[sigType]++;
       const ts = (result.candidate.triggerSource ?? "none") as keyof typeof this.byTriggerSource;
       this.byTriggerSource[ts]++;
+      const sev = result.candidate.severity as keyof typeof this.bySeverity;
+      this.bySeverity[sev]++;
       this.recordDetected(now, result.candidate);
       logger.info("⚡ SIGNAL DETECTED", {
         symbol,
@@ -258,6 +268,7 @@ export class Detector {
     signalsFiltered: number;
     bySignalType: { alt_pump: number; major_crash: number; position_crash: number; major_pump: number };
     byTriggerSource: { "5m": number; "15m": number; "1h": number; none: number };
+    bySeverity: { weak: number; strong: number; major: number };
     dispatch: {
       attempted: number;
       ok: number;
@@ -278,6 +289,7 @@ export class Detector {
       signalsFiltered: this.signalsFiltered,
       bySignalType: this.bySignalType,
       byTriggerSource: this.byTriggerSource,
+      bySeverity: this.bySeverity,
       dispatch: {
         attempted: this.dispatchAttempted,
         ok: this.dispatchOk,
@@ -364,6 +376,10 @@ export class Detector {
       signalType: c.signalType,
       severity: c.severity,
       triggerSource: c.triggerSource,
+      // Sub-minute observability windows — for BACKLOG-3 calibration
+      change30s: c.change30s,
+      change1min: c.change1min,
+      change2min: c.change2min,
       change5m: c.change5m,
       change15m: c.change15m,
       change1h: c.change1h,

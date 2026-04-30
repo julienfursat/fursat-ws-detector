@@ -28,6 +28,9 @@ const LONG_INTERVAL_MS = 30_000;       // 30s between long snapshots
 const LONG_BUFFER_SIZE = 480;          // 480 × 30s = 14400s = 4h
 
 // Lookup offsets in the short buffer (in slots)
+const SHORT_OFFSET_30S = Math.round((30 * 1_000) / SHORT_INTERVAL_MS);  // 6 (30s @ 5s/slot)
+const SHORT_OFFSET_1MIN = Math.round((60 * 1_000) / SHORT_INTERVAL_MS); // 12
+const SHORT_OFFSET_2MIN = Math.round((120 * 1_000) / SHORT_INTERVAL_MS); // 24
 const SHORT_OFFSET_5M = Math.round((5 * 60_000) / SHORT_INTERVAL_MS);   // 60
 const SHORT_OFFSET_15M = Math.round((15 * 60_000) / SHORT_INTERVAL_MS); // 180
 const SHORT_OFFSET_30M = Math.round((30 * 60_000) / SHORT_INTERVAL_MS); // 360
@@ -55,6 +58,11 @@ interface AssetBuffers {
 export interface PriceSnapshot {
   currentPrice: number;
   volume24h: number;
+  // Sub-minute windows (NEW 2026-04-30 — log-only for now, BACKLOG-3 phase A)
+  change30s: number | null;
+  change1min: number | null;
+  change2min: number | null;
+  // Standard windows
   change5m: number | null;
   change15m: number | null;
   change30min: number | null;
@@ -110,6 +118,9 @@ export class RingBuffers {
     const buf = this.buffers.get(symbol);
     if (!buf) return null;
 
+    const change30s = this.computeChange(buf, "short", SHORT_OFFSET_30S);
+    const change1min = this.computeChange(buf, "short", SHORT_OFFSET_1MIN);
+    const change2min = this.computeChange(buf, "short", SHORT_OFFSET_2MIN);
     const change5m = this.computeChange(buf, "short", SHORT_OFFSET_5M);
     const change15m = this.computeChange(buf, "short", SHORT_OFFSET_15M);
     const change30min = this.computeChange(buf, "short", SHORT_OFFSET_30M);
@@ -140,6 +151,7 @@ export class RingBuffers {
     return {
       currentPrice: buf.currentPrice,
       volume24h: buf.currentVolume24h,
+      change30s, change1min, change2min,
       change5m, change15m, change30min, change1h, change4h,
       drawdownFromPeak,
       peakSampleCount,
