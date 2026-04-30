@@ -434,10 +434,14 @@ export class Detector {
     ts: number, symbol: string, reason: SkipReason,
     snap: { change5m: number | null; change15m: number | null; change1h: number | null }
   ): void {
-    this.pendingFiltered.push({
-      ts, symbol, reason,
-      change5m: snap.change5m, change15m: snap.change15m, change1h: snap.change1h,
-    });
+    // BACKLOG-13 phase 1.A (2026-04-30): disabled to reduce Redis writes.
+    // dryrun:filtered_signals_log was used to calibrate fast-exit thresholds.
+    // Calibration done; the log is no longer consulted. To re-enable, uncomment.
+    // this.pendingFiltered.push({
+    //   ts, symbol, reason,
+    //   change5m: snap.change5m, change15m: snap.change15m, change1h: snap.change1h,
+    // });
+    void ts; void symbol; void reason; void snap;
   }
 
   /**
@@ -476,6 +480,17 @@ export class Detector {
    * to amortize Redis cost on bursty pump waves.
    */
   private async flushLogs(): Promise<void> {
+    // BACKLOG-13 phase 1.B (2026-04-30): short-circuit when nothing to flush.
+    // Saves 6 Redis commands every 5s during quiet periods (nights, weekends,
+    // calm market) — typically -50% writes when no signal activity.
+    if (
+      this.pendingDetected.length === 0 &&
+      this.pendingFiltered.length === 0 &&
+      this.pendingFastPath.length === 0
+    ) {
+      return;
+    }
+
     const detectedToFlush = this.pendingDetected.splice(0);
     const filteredToFlush = this.pendingFiltered.splice(0);
     const fastPathToFlush = this.pendingFastPath.splice(0);
