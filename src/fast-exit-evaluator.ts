@@ -32,6 +32,20 @@ import {
 const PARTIAL_TAKEN_KEY = "agent:partial_taken";
 const PARTIAL_TAKEN_CACHE_TTL_MS = 60_000;  // refresh at most once per minute
 
+// BACKLOG-3 phase 2 (2026-05-01) — narrow alias of the 6 reason codes that
+// evaluateFastExitRules can actually produce. The shared FastExitReason type was
+// extended with fast_slow_down/fast_tp/fast_sl for the worker's sub-1min exits
+// (handled in detector.tryDispatchSlowDown), but this evaluator only handles
+// the classical 6 rules. Keeping a narrow local type avoids dead branches in the
+// counter map and the dispatch payload typing.
+type ClassicFastExitReason =
+  | "fast_stop_loss"
+  | "fast_partial_take"
+  | "fast_no_pump_exit"
+  | "fast_ratchet"
+  | "fast_exit_on_green"
+  | "dead_position_exit";
+
 export class FastExitEvaluator {
   private ringBuffers: RingBuffers;
   private positions: PositionsTracker;
@@ -111,8 +125,13 @@ export class FastExitEvaluator {
     if (!verdict) return;
 
     // A rule fired. Trigger dispatch (async, fire-and-forget).
+    // Narrow assert: evaluateFastExitRules only returns ClassicFastExitReason values.
+    // The shared FastExitReason union includes fast_slow_down/fast_tp/fast_sl since
+    // BACKLOG-3 phase 2, but those are produced by detector.tryDispatchSlowDown,
+    // not by evaluateFastExitRules. Cast is safe.
     this.rulesFired++;
-    this.byReasonCode[verdict.reasonCode]++;
+    const reasonCode = verdict.reasonCode as ClassicFastExitReason;
+    this.byReasonCode[reasonCode]++;
     void this.tryDispatch(pos, verdict, tracked);
   }
 
@@ -161,7 +180,7 @@ export class FastExitEvaluator {
 
       const payload: FastExitDispatchPayload = {
         symbol: pos.symbol,
-        reasonCode: verdict.reasonCode,
+        reasonCode: verdict.reasonCode as ClassicFastExitReason,  // safe: see narrow note above
         pnlPct: pos.pnlPct,
         pnlMax: tracked.pnlMax,
         pnlMin: tracked.pnlMin,

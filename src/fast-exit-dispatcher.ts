@@ -35,7 +35,19 @@ const MAX_LOG_ENTRIES = 1000;
 
 export interface FastExitDispatchPayload {
   symbol: string;
-  reasonCode: "fast_stop_loss" | "fast_ratchet" | "fast_exit_on_green" | "dead_position_exit" | "fast_partial_take" | "fast_no_pump_exit";
+  // BACKLOG-3 phase 2 (2026-05-01) — added fast_slow_down/fast_tp/fast_sl, dispatched by
+  // detector.tryDispatchSlowDown on every tick of held positions (sub-1min reactivity).
+  // The 6 classical reasonCodes continue to be dispatched by fast-exit-evaluator.ts.
+  reasonCode:
+    | "fast_stop_loss"
+    | "fast_ratchet"
+    | "fast_exit_on_green"
+    | "dead_position_exit"
+    | "fast_partial_take"
+    | "fast_no_pump_exit"
+    | "fast_slow_down"
+    | "fast_tp"
+    | "fast_sl";
   pnlPct: number;
   pnlMax?: number;
   pnlMin?: number;

@@ -264,7 +264,8 @@ export interface MomentumCandidate {
   // Which classification branch fired this candidate. Useful in logs to distinguish
   // signals that came from the 5m vs 15m vs 1h windows. Null for non-altpump signals
   // (crashes, position_crash, major_pump on BTC) where the source is implicit.
-  triggerSource: "5m" | "15m" | "1h" | null;
+  // BACKLOG-3 phase 2 (2026-05-01): "30s" added for early_pump dispatches by the WS worker.
+  triggerSource: "5m" | "15m" | "1h" | "30s" | null;
 }
 
 // Agent position with enough context to evaluate fast-exit rules.

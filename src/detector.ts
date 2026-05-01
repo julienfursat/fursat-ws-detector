@@ -31,6 +31,7 @@ import { RingBuffers } from "./ring-buffers.js";
 import { checkThrottle } from "./throttle.js";
 import { isBlacklisted } from "./blacklist.js";
 import { dispatchEntry, type DispatchSignal } from "./dispatcher.js";
+import { dispatchFastExit, isInFastExitCooldown, type FastExitDispatchPayload } from "./fast-exit-dispatcher.js";
 import {
   classifySignal,
   evaluateFastPathCandidate,
@@ -41,7 +42,6 @@ import {
   type ClassifyInput,
   type MomentumCandidate,
   type SkipReason,
-  type SlowDownExitVerdict,
   ALT_PUMP_PCT_5M_STRONG,
   ALT_PUMP_PCT_15M_STRONG,
   ALT_PUMP_PCT_1H_WEAK,
@@ -549,6 +549,10 @@ export class Detector {
 
       // All checks passed — dispatch
       this.dispatchAttempted++;
+      // BACKLOG-3 phase 2 (2026-05-01) — DispatchSignal.signalType is narrowly typed
+      // to the original 4 values (alt_pump | major_crash | position_crash | major_pump).
+      // tryDispatch is only called for those 4 (early_pump goes via tryDispatchEarly), so
+      // the cast is safe in practice. Long-term: extend DispatchSignal in dispatcher.ts.
       const signal: DispatchSignal = {
         symbol,
         change5m: c.change5m,
@@ -558,8 +562,8 @@ export class Detector {
         volume24h: c.volume24h,
         drawdownFromPeak: c.drawdownFromPeak,
         severity: c.severity,
-        signalType: c.signalType,
-        triggerSource: c.triggerSource,
+        signalType: c.signalType as DispatchSignal["signalType"],
+        triggerSource: c.triggerSource as DispatchSignal["triggerSource"],
         signalPrice: c.currentPrice,
         signalTimestamp: Date.now(),
       };
@@ -633,7 +637,11 @@ export class Detector {
       // All pre-checks passed — dispatch
       this.dispatchAttempted++;
       this.earlyDispatched++;
-      const signal: DispatchSignal = {
+      // BACKLOG-3 phase 2 (2026-05-01) — early_pump is outside DispatchSignal.signalType
+      // narrow union but accepted by entry.ts as a string. Cast each field individually
+      // and use a separate object so we can attach the sub-minute deltas (which DispatchSignal
+      // also doesn't formally declare). entry.ts reads them via dynamic property access.
+      const signal = {
         symbol,
         change5m: c.change5m,
         change15m: c.change15m,
@@ -642,11 +650,11 @@ export class Detector {
         volume24h: c.volume24h,
         drawdownFromPeak: c.drawdownFromPeak,
         severity: c.severity,
-        signalType: c.signalType,
-        triggerSource: c.triggerSource,
+        signalType: c.signalType as DispatchSignal["signalType"],  // safe cast: entry.ts accepts string
+        triggerSource: c.triggerSource as DispatchSignal["triggerSource"],
         signalPrice: c.currentPrice,
         signalTimestamp: now,
-        // Sub-minute deltas — entry.ts already reads these for fast-path logging
+        // Sub-minute deltas — entry.ts reads these for fast-path logging and early_pump eligibility
         change30s: c.change30s,
         change1min: c.change1min,
         change2min: c.change2min,
@@ -731,17 +739,20 @@ export class Detector {
   /**
    * Evaluates slow-down/tp/sl on a held position. Reads avgBuyPrice from cache
    * (or Redis on cache miss), computes pnlPct, calls evaluateSlowDownExit.
-   * If triggered, POSTs /api/agent/fast-exit with the standard payload.
+   * If triggered, dispatches via the shared fast-exit-dispatcher (same path as
+   * the classical fast-exit-evaluator) — gives us the 10min Redis cooldown
+   * shared with scan.ts for free, and unifies all SELL traffic.
    *
-   * Cooldown: per-symbol 30s to avoid HTTP spam during a tick burst.
-   * The endpoint is also idempotent (Coinbase double-sell rejection).
+   * Two-tier cooldown:
+   *   • In-memory 30s per symbol — absorbs tick-burst spam before any Redis I/O.
+   *   • Redis 10min via fast-exit-dispatcher — survives restarts, shared with scan.ts.
    */
   private async tryDispatchSlowDown(
     symbol: string,
     snap: { currentPrice: number; change30s: number | null; change1min: number | null; change2min: number | null },
     now: number,
   ): Promise<void> {
-    // Cooldown check
+    // Tier 1: in-memory cooldown (30s) — cheap pre-filter
     const lastDispatch = this.slowDownLastDispatch.get(symbol);
     if (lastDispatch && (now - lastDispatch) < Detector.SLOW_DOWN_COOLDOWN_MS) {
       return;
@@ -767,6 +778,7 @@ export class Detector {
     if (!verdict) return;
 
     this.slowDownTriggered++;
+    // Set in-memory cooldown immediately (before any I/O) so concurrent ticks bail fast
     this.slowDownLastDispatch.set(symbol, now);
 
     logger.info("⚡ SLOW-DOWN TRIGGER", {
@@ -774,81 +786,41 @@ export class Detector {
       pnl: pnlPct.toFixed(2), price: snap.currentPrice,
     });
 
-    // POST to /api/agent/fast-exit
+    // Tier 2: Redis cooldown check (10min, shared with scan.ts and fast-exit-evaluator)
     try {
-      const ok = await this.postFastExit({
+      const cooldownActive = await isInFastExitCooldown(symbol);
+      if (cooldownActive) {
+        logger.info("Slow-down SKIPPED — Redis cooldown active (recent fast-exit on this symbol)", {
+          symbol, reasonCode: verdict.reasonCode,
+        });
+        this.recordSlowDown(now, symbol, pnlPct, snap, verdict.reasonCode, verdict.detail, false, "redis_cooldown");
+        return;
+      }
+
+      // Build payload — sub-minute reasonCodes don't use change30min/15m/1h, set null.
+      // pnlMax/pnlMin are tracked by fast-exit-evaluator's PnlTracker, not here. We omit
+      // them rather than sending stale/wrong values; fast-exit.ts treats them as optional.
+      const payload: FastExitDispatchPayload = {
         symbol,
         reasonCode: verdict.reasonCode,
         pnlPct,
         avgBuyPrice,
         currentPrice: snap.currentPrice,
-        change30min: null,  // not used for sub-minute reasons but field is in payload
-        change15m: null,
         change1h: null,
-        signalPrice: snap.currentPrice,
-        signalTimestamp: now,
-      });
-      if (ok) this.slowDownDispatched++;
-      this.recordSlowDown(now, symbol, pnlPct, snap, verdict.reasonCode, verdict.detail, ok);
-    } catch (err) {
-      logger.error("postFastExit threw", { symbol, err: (err as Error).message });
-      this.recordSlowDown(now, symbol, pnlPct, snap, verdict.reasonCode, verdict.detail, false, `exception:${(err as Error).message}`);
-    }
-  }
+        change15m: null,
+        change30min: null,
+        holdingSince: 0,  // unknown to detector; fast-exit.ts only uses this for logging
+      };
 
-  /**
-   * POST to /api/agent/fast-exit with the standard payload shape.
-   * Uses PUBLIC_BASE_URL and CRYPTO_AGENT_SECRET / CRON_SECRET from env.
-   * Returns true on 200, false on any failure (logged, but non-throwing).
-   */
-  private async postFastExit(payload: {
-    symbol: string;
-    reasonCode: string;
-    pnlPct: number;
-    avgBuyPrice: number;
-    currentPrice: number;
-    change30min: number | null;
-    change15m: number | null;
-    change1h: number | null;
-    signalPrice: number | null;
-    signalTimestamp: number | null;
-  }): Promise<boolean> {
-    const baseUrl = process.env.PUBLIC_BASE_URL ?? process.env.FURSAT_BASE_URL ?? "";
-    const secret = process.env.CRYPTO_AGENT_SECRET ?? process.env.CRON_SECRET ?? "";
-    if (!baseUrl || !secret) {
-      logger.warn("postFastExit: missing PUBLIC_BASE_URL or secret env", { symbol: payload.symbol });
-      return false;
-    }
-    const url = `${baseUrl.replace(/\/$/, "")}/api/agent/fast-exit`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8_000);
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-agent-secret": secret,
-          "x-source": "ws-worker",
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        logger.warn("postFastExit non-200", {
-          symbol: payload.symbol, status: res.status,
-          body: txt.slice(0, 200),
-        });
-        return false;
-      }
-      return true;
+      const result = await dispatchFastExit(payload);
+      if (result.ok) this.slowDownDispatched++;
+      this.recordSlowDown(
+        now, symbol, pnlPct, snap, verdict.reasonCode, verdict.detail, result.ok,
+        result.ok ? undefined : (result.cooldownSkipped ? "dispatcher_cooldown" : (result.error ?? `http_${result.status}`)),
+      );
     } catch (err) {
-      logger.warn("postFastExit fetch failed", {
-        symbol: payload.symbol, err: (err as Error).message,
-      });
-      return false;
-    } finally {
-      clearTimeout(timeout);
+      logger.error("dispatchFastExit threw on slow-down", { symbol, err: (err as Error).message });
+      this.recordSlowDown(now, symbol, pnlPct, snap, verdict.reasonCode, verdict.detail, false, `exception:${(err as Error).message}`);
     }
   }
 
