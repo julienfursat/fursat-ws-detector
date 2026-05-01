@@ -34,17 +34,22 @@ import { dispatchEntry, type DispatchSignal } from "./dispatcher.js";
 import {
   classifySignal,
   evaluateFastPathCandidate,
+  evaluateEarlyEntry,
+  evaluateSlowDownExit,
   STABLES,
   MAJORS,
   type ClassifyInput,
   type MomentumCandidate,
   type SkipReason,
+  type SlowDownExitVerdict,
   ALT_PUMP_PCT_5M_STRONG,
   ALT_PUMP_PCT_15M_STRONG,
   ALT_PUMP_PCT_1H_WEAK,
   MAJOR_CRASH_PCT_1H,
   POS_CRASH_PCT_1H,
   MAJOR_PUMP_PCT_1H,
+  EARLY_ENTRY_MIN_CHANGE30S,
+  EARLY_ENTRY_MIN_CHANGE2MIN,
 } from "./lib/signal-rules.js";
 
 // Logs kept in Redis — bounded to prevent unbounded growth.
@@ -52,6 +57,10 @@ import {
 const DETECTED_LOG_KEY = "dryrun:detected_signals_log";
 const FILTERED_LOG_KEY = "dryrun:filtered_signals_log";
 const FASTPATH_LOG_KEY = "dryrun:fastpath_log";  // BACKLOG-3 phase 1, log-only fast-path observation
+// BACKLOG-3 phase 2 (2026-05-01) — ACTIVE early-pump dispatch + slow-down exit observations.
+// Despite "dryrun:" prefix (Redis guard), these logs trace REAL dispatches now, not just hypotheticals.
+const EARLY_DISPATCH_LOG_KEY = "dryrun:early_dispatch_log";
+const SLOW_DOWN_DISPATCH_LOG_KEY = "dryrun:slow_down_dispatch_log";
 const MAX_LOG_ENTRIES = 1000;
 
 // In-memory log buffers (flushed to Redis on a timer for efficiency).
@@ -117,6 +126,43 @@ interface FastPathEntry {
   reasons: string[];
 }
 
+// BACKLOG-3 phase 2 (2026-05-01) — ACTIVE early dispatch log.
+// One entry per actual early_pump dispatch attempt (whether dispatched or skipped).
+// Used to monitor real production behavior and tune EARLY_ENTRY_* thresholds.
+interface EarlyDispatchEntry {
+  ts: number;
+  symbol: string;
+  change30s: number | null;
+  change1min: number | null;
+  change2min: number | null;
+  change5m: number | null;
+  change15m: number | null;
+  change1h: number | null;
+  volume24h: number;
+  drawdownFromPeak: number;
+  isHeld: boolean;
+  // Verdict and disposition
+  isEarly: boolean;        // evaluateEarlyEntry result
+  reason: string;          // explanatory tag
+  dispatched: boolean;     // did we actually call dispatchEntry()
+  dispatchSkipReason?: string;  // throttle / blacklist / inflight (if not dispatched)
+}
+
+// BACKLOG-3 phase 2 (2026-05-01) — ACTIVE slow-down exit dispatch log.
+// One entry per evaluation on a HELD asset that triggered a slow-down/tp/sl verdict.
+interface SlowDownDispatchEntry {
+  ts: number;
+  symbol: string;
+  pnlPct: number;
+  change30s: number | null;
+  change1min: number | null;
+  change2min: number | null;
+  reasonCode: "fast_slow_down" | "fast_tp" | "fast_sl";
+  detail: string;
+  dispatched: boolean;
+  dispatchSkipReason?: string;
+}
+
 export class Detector {
   private ringBuffers: RingBuffers;
   private tradableSymbols: Set<string>;
@@ -127,15 +173,26 @@ export class Detector {
   private pendingDetected: DetectedEntry[] = [];
   private pendingFiltered: FilteredEntry[] = [];
   private pendingFastPath: FastPathEntry[] = [];  // BACKLOG-3 phase 1
+  // BACKLOG-3 phase 2 (2026-05-01) — ACTIVE early-pump and slow-down logs
+  private pendingEarlyDispatch: EarlyDispatchEntry[] = [];
+  private pendingSlowDown: SlowDownDispatchEntry[] = [];
 
   // Counters surfaced via stats()
   private ticksEvaluated = 0;
   private gatePassed = 0;
   private candidatesDetected = 0;
   private signalsFiltered = 0;
-  private bySignalType = { alt_pump: 0, major_crash: 0, position_crash: 0, major_pump: 0 };
-  private byTriggerSource = { "5m": 0, "15m": 0, "1h": 0, none: 0 };
+  private bySignalType = { alt_pump: 0, major_crash: 0, position_crash: 0, major_pump: 0, early_pump: 0 };
+  private byTriggerSource = { "5m": 0, "15m": 0, "1h": 0, "30s": 0, none: 0 };
   private bySeverity = { weak: 0, strong: 0, major: 0 };
+
+  // BACKLOG-3 phase 2 — early/slow-down counters
+  private earlyEvaluated = 0;
+  private earlyTriggered = 0;
+  private earlyDispatched = 0;
+  private slowDownEvaluated = 0;
+  private slowDownTriggered = 0;
+  private slowDownDispatched = 0;
 
   // Étape 2B dispatch counters
   private dispatchAttempted = 0;
@@ -189,6 +246,12 @@ export class Detector {
     // Gate 3: cheap threshold pre-check. Only classify if at least one of
     // the change metrics is past its weakest threshold. This avoids running
     // the full classifier on the 95% of ticks that are routine drift.
+    //
+    // BACKLOG-3 phase 2 (2026-05-01): widened to also pass when:
+    //   (a) Sub-minute deltas suggest an EARLY pump (change30s ≥ 1% AND change2min ≥ 2%)
+    //       — needed because the classical 5m gate fires too late (post-mortem
+    //         showed 15/16 trades entered at <2% from 60min max).
+    //   (b) The asset is HELD — needed to evaluate slow-down/tp/sl exit on every tick.
     const isMajor = MAJORS.has(symbol);
     const isHeld = this.heldSymbolsProvider().has(symbol);
     const passesGate =
@@ -200,7 +263,12 @@ export class Detector {
       || (isMajor && snap.change1h !== null && snap.change1h <= MAJOR_CRASH_PCT_1H)
       || (isHeld && !isMajor && snap.change1h !== null && snap.change1h <= POS_CRASH_PCT_1H)
       // BTC pump trigger
-      || (symbol === "BTC" && snap.change1h !== null && snap.change1h >= MAJOR_PUMP_PCT_1H);
+      || (symbol === "BTC" && snap.change1h !== null && snap.change1h >= MAJOR_PUMP_PCT_1H)
+      // BACKLOG-3 phase 2: early-pump sub-minute trigger
+      || (snap.change30s !== null && snap.change30s >= EARLY_ENTRY_MIN_CHANGE30S
+          && snap.change2min !== null && snap.change2min >= EARLY_ENTRY_MIN_CHANGE2MIN)
+      // BACKLOG-3 phase 2: held positions need every tick for slow-down evaluation
+      || isHeld;
 
     if (!passesGate) return;
     this.gatePassed++;
@@ -282,6 +350,81 @@ export class Detector {
         change15m: snap.change15m?.toFixed(1),
       });
     }
+
+    // ─── BACKLOG-3 phase 2 (2026-05-01) — EARLY ENTRY (sub-minute) ───
+    // Evaluated INDEPENDENTLY of classifySignal, so an asset that didn't trigger
+    // any classical path can still be dispatched as early_pump if sub-minute
+    // velocity meets the criteria. Skip if classify already produced an alt_pump
+    // candidate (already dispatched above) or a held-position signal.
+    const alreadyClassified = result.kind === "candidate"
+      && (result.candidate.signalType === "alt_pump" || result.candidate.signalType === "position_crash");
+    if (!alreadyClassified && !isHeld) {
+      this.earlyEvaluated++;
+      const earlyVerdict = evaluateEarlyEntry(input);
+      if (earlyVerdict.isEarly) {
+        this.earlyTriggered++;
+        // Synthesize a MomentumCandidate of type "early_pump" with severity "strong"
+        // so entry.ts routes it to fast-path (Claude bypassed). The amount is
+        // controlled in entry.ts via the early_pump signalType branch ($80 nominal).
+        const earlyCandidate: MomentumCandidate = {
+          symbol,
+          currentPrice: snap.currentPrice,
+          change30s: snap.change30s,
+          change1min: snap.change1min,
+          change2min: snap.change2min,
+          change5m: snap.change5m,
+          change15m: snap.change15m,
+          change1h: snap.change1h,
+          change4h: snap.change4h,
+          change24h,
+          volume24h: snap.volume24h,
+          score: 0,                       // not used downstream for early_pump
+          signalType: "early_pump",
+          severity: "strong",
+          isHeld,
+          drawdownFromPeak: snap.drawdownFromPeak,
+          peakSampleCount: snap.peakSampleCount,
+          triggerSource: "30s",
+        };
+        logger.info("⚡ EARLY DISPATCH", {
+          symbol, ...{
+            change30s: snap.change30s?.toFixed(2),
+            change1min: snap.change1min?.toFixed(2),
+            change2min: snap.change2min?.toFixed(2),
+            change5m: snap.change5m?.toFixed(2),
+            volume24h: Math.round(snap.volume24h / 1000) + "k",
+            reason: earlyVerdict.reason,
+          },
+        });
+        // Counter and log are updated inside tryDispatchEarly (knows actual disposition)
+        void this.tryDispatchEarly(earlyCandidate, earlyVerdict.reason);
+      } else {
+        // Optional: log near-miss early evaluations for calibration. Only log when
+        // sub-minute data is present and at least one threshold was close, otherwise
+        // we'd flood the log on every routine tick.
+        if (snap.change30s !== null && snap.change30s >= 0.5) {
+          this.recordEarlyDispatch(now, input, earlyVerdict.isEarly, earlyVerdict.reason, false, "not_triggered");
+        }
+      }
+    }
+
+    // ─── BACKLOG-3 phase 2 (2026-05-01) — SLOW-DOWN EXIT (sub-minute) ───
+    // Evaluated on every tick of a HELD asset. Dispatches POST to /api/agent/fast-exit
+    // with reasonCode = fast_slow_down / fast_tp / fast_sl when the rule fires.
+    if (isHeld) {
+      this.slowDownEvaluated++;
+      // pnlPct is unknown at the worker — we don't have avgBuyPrice in-memory.
+      // The worker needs to ask the entry.ts side for the position info. To keep
+      // this fast, we let the /api/agent/fast-exit endpoint do the pnl computation
+      // and re-evaluate the rule server-side. Worker only sends the sub-minute
+      // signature; server fetches avgBuyPrice from trade_meta.
+      // SO: we always send the sub-minute candidate and let server decide.
+      // Optimization: only POST when ANY of the three rules COULD fire. Cheap heuristic:
+      //   change30s ≥ -1.0% safety_check: true (wide → catches tp/slow-down)
+      //   OR change30s ≤ -1.0%           (catches fast_sl)
+      // i.e. always — so we throttle by per-symbol cooldown instead.
+      void this.tryDispatchSlowDown(symbol, snap, now);
+    }
   }
 
   start(): void {
@@ -304,8 +447,8 @@ export class Detector {
     gatePassed: number;
     candidatesDetected: number;
     signalsFiltered: number;
-    bySignalType: { alt_pump: number; major_crash: number; position_crash: number; major_pump: number };
-    byTriggerSource: { "5m": number; "15m": number; "1h": number; none: number };
+    bySignalType: { alt_pump: number; major_crash: number; position_crash: number; major_pump: number; early_pump: number };
+    byTriggerSource: { "5m": number; "15m": number; "1h": number; "30s": number; none: number };
     bySeverity: { weak: number; strong: number; major: number };
     dispatch: {
       attempted: number;
@@ -316,9 +459,21 @@ export class Detector {
       preCheckFailed: { throttle: number; blacklist: number };
       inFlight: number;
     };
+    earlyEntry: {
+      evaluated: number;
+      triggered: number;
+      dispatched: number;
+    };
+    slowDown: {
+      evaluated: number;
+      triggered: number;
+      dispatched: number;
+    };
     pendingDetected: number;
     pendingFiltered: number;
     pendingFastPath: number;
+    pendingEarlyDispatch: number;
+    pendingSlowDown: number;
   } {
     return {
       tradableUniverse: this.tradableSymbols.size,
@@ -338,9 +493,21 @@ export class Detector {
         preCheckFailed: this.dispatchPreCheckFailed,
         inFlight: this.inFlightDispatches.size,
       },
+      earlyEntry: {
+        evaluated: this.earlyEvaluated,
+        triggered: this.earlyTriggered,
+        dispatched: this.earlyDispatched,
+      },
+      slowDown: {
+        evaluated: this.slowDownEvaluated,
+        triggered: this.slowDownTriggered,
+        dispatched: this.slowDownDispatched,
+      },
       pendingDetected: this.pendingDetected.length,
       pendingFiltered: this.pendingFiltered.length,
       pendingFastPath: this.pendingFastPath.length,
+      pendingEarlyDispatch: this.pendingEarlyDispatch.length,
+      pendingSlowDown: this.pendingSlowDown.length,
     };
   }
 
@@ -407,6 +574,341 @@ export class Detector {
     } finally {
       this.inFlightDispatches.delete(symbol);
     }
+  }
+
+  // ─── BACKLOG-3 phase 2 (2026-05-01) — Early dispatch + Slow-down ────────────
+
+  /**
+   * Cache for avgBuyPrice lookups from agent:trade_meta.
+   * TTL 60s — long enough to avoid Redis spam during pump bursts (10+ ticks/s),
+   * short enough that fresh BUYs are reflected within a minute.
+   * Cache shape: { symbol → { avgBuyPrice, fetchedAt } }
+   */
+  private avgBuyPriceCache = new Map<string, { avgBuyPrice: number | null; fetchedAt: number }>();
+  private static readonly AVG_BUY_CACHE_TTL_MS = 60_000;
+
+  /**
+   * Per-symbol slow-down dispatch cooldown (ms). Avoids re-firing fast_slow_down
+   * 50 times in a row on the same tick burst. The actual SELL is idempotent
+   * server-side (Coinbase rejects double-sell), but we avoid wasteful HTTP traffic.
+   */
+  private slowDownLastDispatch = new Map<string, number>();
+  private static readonly SLOW_DOWN_COOLDOWN_MS = 30_000;
+
+  /**
+   * Dispatches an early_pump candidate to /api/agent/entry. Same pre-check stack
+   * as tryDispatch (throttle, blacklist, in-flight guard).
+   */
+  private async tryDispatchEarly(c: MomentumCandidate, earlyReason: string): Promise<void> {
+    const symbol = c.symbol;
+    const now = Date.now();
+
+    if (this.inFlightDispatches.has(symbol)) {
+      this.recordEarlyDispatch(now, this.candidateToInput(c), true, earlyReason, false, "in_flight");
+      return;
+    }
+    this.inFlightDispatches.add(symbol);
+
+    try {
+      const throttleCheck = await checkThrottle(symbol);
+      if (!throttleCheck.allowed) {
+        this.dispatchPreCheckFailed.throttle++;
+        this.recordEarlyDispatch(now, this.candidateToInput(c), true, earlyReason, false, `throttle:${throttleCheck.reason}`);
+        logger.info("Early dispatch SKIPPED — throttled", {
+          symbol, reason: throttleCheck.reason,
+        });
+        return;
+      }
+
+      const blacklistCheck = await isBlacklisted(symbol);
+      if (blacklistCheck.blacklisted) {
+        this.dispatchPreCheckFailed.blacklist++;
+        this.recordEarlyDispatch(now, this.candidateToInput(c), true, earlyReason, false, `blacklist:${blacklistCheck.reason}`);
+        logger.info("Early dispatch SKIPPED — blacklisted", {
+          symbol, reason: blacklistCheck.reason,
+        });
+        return;
+      }
+
+      // All pre-checks passed — dispatch
+      this.dispatchAttempted++;
+      this.earlyDispatched++;
+      const signal: DispatchSignal = {
+        symbol,
+        change5m: c.change5m,
+        change15m: c.change15m,
+        change1h: c.change1h,
+        change24h: c.change24h,
+        volume24h: c.volume24h,
+        drawdownFromPeak: c.drawdownFromPeak,
+        severity: c.severity,
+        signalType: c.signalType,
+        triggerSource: c.triggerSource,
+        signalPrice: c.currentPrice,
+        signalTimestamp: now,
+        // Sub-minute deltas — entry.ts already reads these for fast-path logging
+        change30s: c.change30s,
+        change1min: c.change1min,
+        change2min: c.change2min,
+      } as DispatchSignal;
+      const result = await dispatchEntry(signal);
+
+      if (result.ok) this.dispatchOk++;
+      else if (result.skipped) this.dispatchSkipped++;
+      else if (result.error) this.dispatchNetworkError++;
+      else this.dispatchHttpError++;
+
+      this.recordEarlyDispatch(now, this.candidateToInput(c), true, earlyReason, true);
+    } catch (err) {
+      logger.error("tryDispatchEarly threw", { symbol, err: (err as Error).message });
+      this.recordEarlyDispatch(now, this.candidateToInput(c), true, earlyReason, false, `exception:${(err as Error).message}`);
+    } finally {
+      this.inFlightDispatches.delete(symbol);
+    }
+  }
+
+  /**
+   * Helper: rebuild a ClassifyInput from a MomentumCandidate for logging.
+   * Only used by recordEarlyDispatch — extracts the fields we want to persist.
+   */
+  private candidateToInput(c: MomentumCandidate): ClassifyInput {
+    return {
+      symbol: c.symbol,
+      currentPrice: c.currentPrice,
+      change30s: c.change30s,
+      change1min: c.change1min,
+      change2min: c.change2min,
+      change5m: c.change5m,
+      change15m: c.change15m,
+      change1h: c.change1h,
+      change4h: c.change4h,
+      change24h: c.change24h,
+      volume24h: c.volume24h,
+      isHeld: c.isHeld,
+      isMajor: MAJORS.has(c.symbol),
+      drawdownFromPeak: c.drawdownFromPeak,
+      peakSampleCount: c.peakSampleCount,
+    };
+  }
+
+  /**
+   * Reads avgBuyPrice for a symbol from agent:trade_meta with 60s in-memory cache.
+   * Returns null if no position metadata exists (e.g. legacy or just-bought asset).
+   *
+   * trade_meta shape: { [orderId]: { symbol, side, avgBuyPrice, ... } }
+   * For each symbol, we want the avgBuyPrice of the LATEST BUY. We scan in reverse
+   * insertion order (objects preserve insertion in modern JS).
+   */
+  private async getAvgBuyPrice(symbol: string): Promise<number | null> {
+    const cached = this.avgBuyPriceCache.get(symbol);
+    if (cached && (Date.now() - cached.fetchedAt) < Detector.AVG_BUY_CACHE_TTL_MS) {
+      return cached.avgBuyPrice;
+    }
+    try {
+      const meta = await redisGet<Record<string, { symbol?: string; side?: string; avgBuyPrice?: number; price?: number }>>("agent:trade_meta");
+      if (!meta) {
+        this.avgBuyPriceCache.set(symbol, { avgBuyPrice: null, fetchedAt: Date.now() });
+        return null;
+      }
+      // Walk entries in reverse to find the most recent BUY for this symbol
+      const entries = Object.entries(meta);
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const [, m] = entries[i];
+        if (m && m.symbol === symbol && (m.side ?? "").toUpperCase() === "BUY") {
+          const price = m.avgBuyPrice ?? m.price ?? null;
+          this.avgBuyPriceCache.set(symbol, { avgBuyPrice: price, fetchedAt: Date.now() });
+          return price;
+        }
+      }
+      this.avgBuyPriceCache.set(symbol, { avgBuyPrice: null, fetchedAt: Date.now() });
+      return null;
+    } catch (err) {
+      logger.warn("getAvgBuyPrice failed", { symbol, err: (err as Error).message });
+      return null;
+    }
+  }
+
+  /**
+   * Evaluates slow-down/tp/sl on a held position. Reads avgBuyPrice from cache
+   * (or Redis on cache miss), computes pnlPct, calls evaluateSlowDownExit.
+   * If triggered, POSTs /api/agent/fast-exit with the standard payload.
+   *
+   * Cooldown: per-symbol 30s to avoid HTTP spam during a tick burst.
+   * The endpoint is also idempotent (Coinbase double-sell rejection).
+   */
+  private async tryDispatchSlowDown(
+    symbol: string,
+    snap: { currentPrice: number; change30s: number | null; change1min: number | null; change2min: number | null },
+    now: number,
+  ): Promise<void> {
+    // Cooldown check
+    const lastDispatch = this.slowDownLastDispatch.get(symbol);
+    if (lastDispatch && (now - lastDispatch) < Detector.SLOW_DOWN_COOLDOWN_MS) {
+      return;
+    }
+
+    // Need sub-minute data
+    if (snap.change30s == null || snap.change1min == null || snap.change2min == null) {
+      return;
+    }
+
+    // Need avgBuyPrice — async but cached
+    const avgBuyPrice = await this.getAvgBuyPrice(symbol);
+    if (avgBuyPrice == null || avgBuyPrice <= 0) return;
+
+    const pnlPct = ((snap.currentPrice - avgBuyPrice) / avgBuyPrice) * 100;
+    const verdict = evaluateSlowDownExit({
+      pnlPct,
+      change30s: snap.change30s,
+      change1min: snap.change1min,
+      change2min: snap.change2min,
+    });
+
+    if (!verdict) return;
+
+    this.slowDownTriggered++;
+    this.slowDownLastDispatch.set(symbol, now);
+
+    logger.info("⚡ SLOW-DOWN TRIGGER", {
+      symbol, reasonCode: verdict.reasonCode, detail: verdict.detail,
+      pnl: pnlPct.toFixed(2), price: snap.currentPrice,
+    });
+
+    // POST to /api/agent/fast-exit
+    try {
+      const ok = await this.postFastExit({
+        symbol,
+        reasonCode: verdict.reasonCode,
+        pnlPct,
+        avgBuyPrice,
+        currentPrice: snap.currentPrice,
+        change30min: null,  // not used for sub-minute reasons but field is in payload
+        change15m: null,
+        change1h: null,
+        signalPrice: snap.currentPrice,
+        signalTimestamp: now,
+      });
+      if (ok) this.slowDownDispatched++;
+      this.recordSlowDown(now, symbol, pnlPct, snap, verdict.reasonCode, verdict.detail, ok);
+    } catch (err) {
+      logger.error("postFastExit threw", { symbol, err: (err as Error).message });
+      this.recordSlowDown(now, symbol, pnlPct, snap, verdict.reasonCode, verdict.detail, false, `exception:${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * POST to /api/agent/fast-exit with the standard payload shape.
+   * Uses PUBLIC_BASE_URL and CRYPTO_AGENT_SECRET / CRON_SECRET from env.
+   * Returns true on 200, false on any failure (logged, but non-throwing).
+   */
+  private async postFastExit(payload: {
+    symbol: string;
+    reasonCode: string;
+    pnlPct: number;
+    avgBuyPrice: number;
+    currentPrice: number;
+    change30min: number | null;
+    change15m: number | null;
+    change1h: number | null;
+    signalPrice: number | null;
+    signalTimestamp: number | null;
+  }): Promise<boolean> {
+    const baseUrl = process.env.PUBLIC_BASE_URL ?? process.env.FURSAT_BASE_URL ?? "";
+    const secret = process.env.CRYPTO_AGENT_SECRET ?? process.env.CRON_SECRET ?? "";
+    if (!baseUrl || !secret) {
+      logger.warn("postFastExit: missing PUBLIC_BASE_URL or secret env", { symbol: payload.symbol });
+      return false;
+    }
+    const url = `${baseUrl.replace(/\/$/, "")}/api/agent/fast-exit`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8_000);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-agent-secret": secret,
+          "x-source": "ws-worker",
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        logger.warn("postFastExit non-200", {
+          symbol: payload.symbol, status: res.status,
+          body: txt.slice(0, 200),
+        });
+        return false;
+      }
+      return true;
+    } catch (err) {
+      logger.warn("postFastExit fetch failed", {
+        symbol: payload.symbol, err: (err as Error).message,
+      });
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Buffers an early-dispatch observation for periodic flush to
+   * dryrun:early_dispatch_log.
+   */
+  private recordEarlyDispatch(
+    ts: number,
+    input: ClassifyInput,
+    isEarly: boolean,
+    reason: string,
+    dispatched: boolean,
+    dispatchSkipReason?: string,
+  ): void {
+    this.pendingEarlyDispatch.push({
+      ts,
+      symbol: input.symbol,
+      change30s: input.change30s ?? null,
+      change1min: input.change1min ?? null,
+      change2min: input.change2min ?? null,
+      change5m: input.change5m,
+      change15m: input.change15m,
+      change1h: input.change1h,
+      volume24h: input.volume24h,
+      drawdownFromPeak: input.drawdownFromPeak,
+      isHeld: input.isHeld,
+      isEarly,
+      reason,
+      dispatched,
+      dispatchSkipReason,
+    });
+  }
+
+  /**
+   * Buffers a slow-down dispatch observation for periodic flush to
+   * dryrun:slow_down_dispatch_log.
+   */
+  private recordSlowDown(
+    ts: number,
+    symbol: string,
+    pnlPct: number,
+    snap: { change30s: number | null; change1min: number | null; change2min: number | null },
+    reasonCode: "fast_slow_down" | "fast_tp" | "fast_sl",
+    detail: string,
+    dispatched: boolean,
+    dispatchSkipReason?: string,
+  ): void {
+    this.pendingSlowDown.push({
+      ts,
+      symbol,
+      pnlPct,
+      change30s: snap.change30s,
+      change1min: snap.change1min,
+      change2min: snap.change2min,
+      reasonCode,
+      detail,
+      dispatched,
+      dispatchSkipReason,
+    });
   }
 
   private recordDetected(ts: number, c: MomentumCandidate): void {
@@ -481,12 +983,15 @@ export class Detector {
    */
   private async flushLogs(): Promise<void> {
     // BACKLOG-13 phase 1.B (2026-04-30): short-circuit when nothing to flush.
-    // Saves 6 Redis commands every 5s during quiet periods (nights, weekends,
+    // Saves Redis commands every 5s during quiet periods (nights, weekends,
     // calm market) — typically -50% writes when no signal activity.
+    // BACKLOG-3 phase 2 (2026-05-01): added early/slow-down buffers to the check.
     if (
       this.pendingDetected.length === 0 &&
       this.pendingFiltered.length === 0 &&
-      this.pendingFastPath.length === 0
+      this.pendingFastPath.length === 0 &&
+      this.pendingEarlyDispatch.length === 0 &&
+      this.pendingSlowDown.length === 0
     ) {
       return;
     }
@@ -494,6 +999,8 @@ export class Detector {
     const detectedToFlush = this.pendingDetected.splice(0);
     const filteredToFlush = this.pendingFiltered.splice(0);
     const fastPathToFlush = this.pendingFastPath.splice(0);
+    const earlyToFlush = this.pendingEarlyDispatch.splice(0);
+    const slowDownToFlush = this.pendingSlowDown.splice(0);
 
     if (detectedToFlush.length > 0) {
       try {
@@ -527,6 +1034,30 @@ export class Detector {
       } catch (err) {
         logger.warn("Failed to flush fastpath log", { err: (err as Error).message });
         this.pendingFastPath.unshift(...fastPathToFlush);
+      }
+    }
+
+    // BACKLOG-3 phase 2 — flush early-dispatch log
+    if (earlyToFlush.length > 0) {
+      try {
+        const existing: EarlyDispatchEntry[] = (await redisGet<EarlyDispatchEntry[]>(EARLY_DISPATCH_LOG_KEY)) ?? [];
+        const merged = [...earlyToFlush, ...existing].slice(0, MAX_LOG_ENTRIES);
+        await redisSet(EARLY_DISPATCH_LOG_KEY, merged);
+      } catch (err) {
+        logger.warn("Failed to flush early dispatch log", { err: (err as Error).message });
+        this.pendingEarlyDispatch.unshift(...earlyToFlush);
+      }
+    }
+
+    // BACKLOG-3 phase 2 — flush slow-down dispatch log
+    if (slowDownToFlush.length > 0) {
+      try {
+        const existing: SlowDownDispatchEntry[] = (await redisGet<SlowDownDispatchEntry[]>(SLOW_DOWN_DISPATCH_LOG_KEY)) ?? [];
+        const merged = [...slowDownToFlush, ...existing].slice(0, MAX_LOG_ENTRIES);
+        await redisSet(SLOW_DOWN_DISPATCH_LOG_KEY, merged);
+      } catch (err) {
+        logger.warn("Failed to flush slow-down log", { err: (err as Error).message });
+        this.pendingSlowDown.unshift(...slowDownToFlush);
       }
     }
   }

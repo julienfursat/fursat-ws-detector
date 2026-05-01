@@ -112,6 +112,42 @@ export const FASTPATH_LOG_MIN_VOLUME_24H = 1_000_000;
 export const FASTPATH_LOG_MAX_CHANGE5M = 4.0;
 export const FASTPATH_LOG_MIN_CHANGE1H = -3.0;
 
+// ─── EARLY ENTRY sub-1min (BACKLOG-3 phase 2 — 2026-05-01) ─────────────────────
+// Detects pumps EARLIER than the classical 5m/15m/1h windows allow.
+// Rationale: post-mortem of 16 altcoin trades showed 15/16 entered at <2% from
+// the 60min max → systematic "late entry". The 5m/15m windows fire at the
+// END of the pump curve, not at its start. Sub-minute deltas catch the
+// early ramp-up phase BEFORE the 5m window has time to register the move.
+//
+// Activation rule: change30s ≥ 1.0% AND change2min ≥ 2.0% AND change5m < 4.0%
+//                  AND volume24h ≥ $1M AND drawdownFromPeak > -2% AND !isHeld.
+// The "change5m < 4%" cap is critical — it ensures we're EARLY and not just
+// duplicating the classical pumpdetection.
+export const EARLY_ENTRY_MIN_CHANGE30S = 1.0;       // %, last 30 seconds
+export const EARLY_ENTRY_MIN_CHANGE2MIN = 2.0;      // %, last 2 minutes
+export const EARLY_ENTRY_MAX_CHANGE5M = 4.0;        // %, must NOT have triggered classical paths
+export const EARLY_ENTRY_MIN_VOLUME_24H = 1_000_000;// $, no shitcoins
+export const EARLY_ENTRY_MIN_DRAWDOWN_PCT = -2.0;   // %, recent peak still close
+export const EARLY_ENTRY_MIN_CHANGE1H = -3.0;       // %, no dead-cat-bounce
+
+// ─── SLOW DOWN EXIT sub-1min (BACKLOG-3 phase 2 — 2026-05-01) ──────────────────
+// Sells when the pump is still positive but the velocity is collapsing.
+// Rationale: waiting for change30s ≤ 0% means we already lost 0.5-1% from the
+// peak. Detecting velocity decay (vitesse_30s < 0.5 × vitesse_2m) catches the
+// inflection BEFORE the actual reversal. Net: capture more of the pump's gain.
+//
+// All three velocities computed as %/sec from the corresponding window:
+//   v30s = change30s / 30,  v1m = change1min / 60,  v2m = change2min / 120.
+//
+// SLOW_DOWN trigger: pnlPct ≥ 2.0% AND change30s > 0 AND v30s < 0.5*v2m AND v30s < v1m.
+// FAST_TP        : pnlPct ≥ 5.0%
+// FAST_SL        : change30s ≤ -1.0% AND pnlPct ≥ -3.0% (catches violent reversals before stop_loss kicks in)
+export const SLOW_DOWN_MIN_PNL_PCT = 2.0;           // pnl_pct gross threshold (≈ +1.5% net after 0.5% round-trip fees)
+export const SLOW_DOWN_VELOCITY_RATIO = 0.5;        // v30s / v2m must be below this
+export const FAST_TP_PNL_PCT = 5.0;                 // pnl_pct that triggers immediate take-profit
+export const FAST_SL_CHANGE30S_PCT = -1.0;          // change30s that triggers safety stop
+export const FAST_SL_MIN_PNL_PCT = -3.0;            // only fire fast_sl if pnl is not already disaster
+
 // ═════ CONSTANTES — SEUILS DE CRASH / MAJORS ═════════════════════════════════
 
 // Crash thresholds on open positions (altcoins held in portfolio)
@@ -220,7 +256,7 @@ export interface MomentumCandidate {
   change24h: number;
   volume24h: number;
   score: number;
-  signalType: "alt_pump" | "major_crash" | "major_pump" | "position_crash";
+  signalType: "alt_pump" | "major_crash" | "major_pump" | "position_crash" | "early_pump";
   severity: "weak" | "strong" | "major";
   isHeld: boolean;
   drawdownFromPeak: number;
@@ -470,7 +506,10 @@ export type FastExitReason =
   | "fast_no_pump_exit"
   | "fast_ratchet"
   | "fast_exit_on_green"
-  | "dead_position_exit";
+  | "dead_position_exit"
+  | "fast_slow_down"     // BACKLOG-3 phase 2 — sub-1min velocity decay exit
+  | "fast_tp"            // BACKLOG-3 phase 2 — sub-1min take-profit at +5%
+  | "fast_sl";           // BACKLOG-3 phase 2 — sub-1min safety stop on violent reversal
 
 /**
  * Context for evaluating fast-exit rules on a position.
@@ -657,4 +696,169 @@ export function evaluateFastPathCandidate(candidate: MomentumCandidate): FastPat
   }
 
   return { wouldFireStrong, wouldFireMajor, wouldFilterDead, reasons };
+}
+// ═════ EARLY ENTRY SUB-1MIN (fonction pure — BACKLOG-3 phase 2) ═══════════════
+// 2026-05-01 — Détection précoce des pumps via les fenêtres sub-minute, AVANT que
+// les fenêtres classiques (5m/15m/1h) ne signalent. Catch les ramps-up à T+30-60s
+// au lieu de T+5-10min, où les seuils classiques détectent typiquement le SOMMET.
+
+export interface EarlyEntryResult {
+  /** Le candidate doit être dispatché en early-pump */
+  isEarly: boolean;
+  /** Tag explicatif pour les logs */
+  reason: string;
+}
+
+/**
+ * Évalue si un tick correspond à un démarrage précoce de pump.
+ *
+ * NE TIENT PAS COMPTE DU CLASSIFY CLASSIQUE — cette fonction est appelée
+ * indépendamment, après que classifySignal() a renvoyé "no_signal" ou "skip".
+ * Si elle déclenche, on synthétise un MomentumCandidate de type "early_pump"
+ * qui sera dispatché en fast-path direct (pas d'appel Claude).
+ *
+ * Pure : aucun I/O, pas de Redis, pas de fetch.
+ *
+ * Conditions (toutes doivent être vraies) :
+ *   - change30s ≥ EARLY_ENTRY_MIN_CHANGE30S          (1.0%)
+ *   - change2min ≥ EARLY_ENTRY_MIN_CHANGE2MIN        (2.0%)
+ *   - change5m  <  EARLY_ENTRY_MAX_CHANGE5M          (4.0%)  ← critique : on est EARLY
+ *   - volume24h ≥ EARLY_ENTRY_MIN_VOLUME_24H         ($1M)
+ *   - drawdownFromPeak > EARLY_ENTRY_MIN_DRAWDOWN_PCT (-2%)
+ *   - change1h > EARLY_ENTRY_MIN_CHANGE1H             (-3%, anti dead-cat-bounce)
+ *   - !isHeld
+ */
+export function evaluateEarlyEntry(input: ClassifyInput): EarlyEntryResult {
+  const {
+    change30s, change2min, change5m, change1h, volume24h, isHeld, drawdownFromPeak, symbol,
+  } = input;
+
+  // Stables and majors never qualify (defensive — should be filtered upstream too)
+  if (STABLES.has(symbol) || MAJORS.has(symbol)) {
+    return { isEarly: false, reason: "stable_or_major" };
+  }
+  if (isHeld) {
+    return { isEarly: false, reason: "already_held" };
+  }
+  if (change30s == null || change2min == null) {
+    return { isEarly: false, reason: "no_sub_minute_data" };
+  }
+  if (volume24h < EARLY_ENTRY_MIN_VOLUME_24H) {
+    return { isEarly: false, reason: `low_volume:${(volume24h / 1_000_000).toFixed(2)}M` };
+  }
+  // Sanity: reject corrupt volume payloads (cf. MOG bug 2026-05-01)
+  if (volume24h >= 100_000_000_000) {
+    return { isEarly: false, reason: "corrupt_volume" };
+  }
+  if (drawdownFromPeak <= EARLY_ENTRY_MIN_DRAWDOWN_PCT) {
+    return { isEarly: false, reason: `drawdown_too_deep:${drawdownFromPeak.toFixed(1)}%` };
+  }
+  if (change1h !== null && change1h <= EARLY_ENTRY_MIN_CHANGE1H) {
+    return { isEarly: false, reason: `dead_cat_bounce:c1h=${change1h.toFixed(1)}%` };
+  }
+  // The "EARLY" gate: must NOT have already triggered classical paths
+  if (change5m !== null && change5m >= EARLY_ENTRY_MAX_CHANGE5M) {
+    return { isEarly: false, reason: `not_early:c5m=${change5m.toFixed(1)}%` };
+  }
+  // Core trigger
+  if (change30s < EARLY_ENTRY_MIN_CHANGE30S) {
+    return { isEarly: false, reason: `slow_30s:${change30s.toFixed(2)}%` };
+  }
+  if (change2min < EARLY_ENTRY_MIN_CHANGE2MIN) {
+    return { isEarly: false, reason: `slow_2m:${change2min.toFixed(2)}%` };
+  }
+
+  return {
+    isEarly: true,
+    reason: `early_pump: 30s=${change30s.toFixed(2)}% 2m=${change2min.toFixed(2)}% 5m=${change5m?.toFixed(2) ?? "n/a"}%`,
+  };
+}
+
+// ═════ SLOW-DOWN EXIT SUB-1MIN (fonction pure — BACKLOG-3 phase 2) ════════════
+// 2026-05-01 — Sortie sur décélération du pump (vitesse instantanée chute) plutôt
+// que sur retournement (prix qui baisse). Évite de "rendre" 0.5-1% au marché en
+// attendant la confirmation de la baisse.
+
+export interface SlowDownExitContext {
+  /** PnL gross actuel (current/avgBuy - 1) × 100, en % */
+  pnlPct: number;
+  /** Variations sub-minute du tick courant */
+  change30s: number | null;
+  change1min: number | null;
+  change2min: number | null;
+}
+
+export interface SlowDownExitVerdict {
+  reasonCode: "fast_slow_down" | "fast_tp" | "fast_sl";
+  /** Détails pour les logs (vitesses, ratios) */
+  detail: string;
+}
+
+/**
+ * Évalue trois règles d'exit sub-1min sur une position détenue :
+ *   1. fast_tp        — pnl ≥ +5% → take-profit immédiat (priorité 1)
+ *   2. fast_sl        — change30s ≤ -1% ET pnl ≥ -3% → safety stop avant fast_stop_loss (priorité 2)
+ *   3. fast_slow_down — pnl ≥ +2% ET change30s > 0 ET v30s < 0.5×v2m ET v30s < v1m (priorité 3)
+ *
+ * Returns null si aucune règle ne déclenche.
+ *
+ * Pure : aucun I/O. Le caller (worker WS) appelle cette fonction à chaque tick
+ * d'un asset qu'on tient, avec le pnlPct calculé à partir du prix courant et de
+ * l'avgBuyPrice (lus depuis trade_meta côté worker, ou depuis Redis).
+ */
+export function evaluateSlowDownExit(ctx: SlowDownExitContext): SlowDownExitVerdict | null {
+  const { pnlPct, change30s, change1min, change2min } = ctx;
+
+  // Need sub-minute data to reason about velocity
+  if (change30s == null || change1min == null || change2min == null) {
+    return null;
+  }
+
+  // Rule 1: fast_tp — take-profit at +5% gross (≈ +4.5% net after fees)
+  if (pnlPct >= FAST_TP_PNL_PCT) {
+    return {
+      reasonCode: "fast_tp",
+      detail: `pnl=${pnlPct.toFixed(2)}% ≥ ${FAST_TP_PNL_PCT}%`,
+    };
+  }
+
+  // Rule 2: fast_sl — violent reversal sub-1min, sortie d'urgence avant que fast_stop_loss
+  // (qui a besoin de change1h ≤ -8% AND pnl ≤ -10%) ne kicke. Sauve typiquement 5-7 points
+  // de perte sur les retournements brutaux.
+  if (change30s <= FAST_SL_CHANGE30S_PCT && pnlPct >= FAST_SL_MIN_PNL_PCT) {
+    return {
+      reasonCode: "fast_sl",
+      detail: `change30s=${change30s.toFixed(2)}% ≤ ${FAST_SL_CHANGE30S_PCT}%, pnl=${pnlPct.toFixed(2)}%`,
+    };
+  }
+
+  // Rule 3: fast_slow_down — pump still positive but velocity collapsing
+  if (pnlPct < SLOW_DOWN_MIN_PNL_PCT) {
+    return null;  // not enough cushion to lock in
+  }
+  if (change30s <= 0) {
+    return null;  // already turning negative — fast_sl branch handles violent cases, otherwise
+                  // we fall back to existing fast-exit rules (ratchet, dead_position_exit)
+  }
+
+  // Velocities in %/sec
+  const v30s = change30s / 30;
+  const v1m  = change1min / 60;
+  const v2m  = change2min / 120;
+
+  // Avoid division-by-zero / pathological cases
+  if (v2m <= 0) return null;
+
+  const ratio = v30s / v2m;
+  const decelerating = (v30s < v1m);
+  const speedHalved  = (ratio < SLOW_DOWN_VELOCITY_RATIO);
+
+  if (speedHalved && decelerating) {
+    return {
+      reasonCode: "fast_slow_down",
+      detail: `pnl=${pnlPct.toFixed(2)}% v30s=${(v30s * 100).toFixed(3)}%/s v2m=${(v2m * 100).toFixed(3)}%/s ratio=${ratio.toFixed(2)}`,
+    };
+  }
+
+  return null;
 }
