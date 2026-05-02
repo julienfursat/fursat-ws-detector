@@ -165,13 +165,30 @@ export class PositionsTracker {
         accountsBySymbol.set(symbol, { available, total });
       }
 
-      // 2. Read trade_meta from Redis, aggregate by symbol (most recent BUY per symbol)
+      // 2. Read trade_meta from Redis, aggregate by symbol (most recent BUY per symbol).
+      //
+      // BACKLOG-3 phase 3 (2026-05-02) — Stale-meta guard.
+      // Reject trade_meta entries whose buyTimestamp is older than STALE_META_MAX_AGE_MS.
+      // Rationale: trade_meta is append-only (BUYs are never deleted, even after a full SELL).
+      // If we re-buy an asset days/weeks after a previous full liquidation, the OLD
+      // avgBuyPrice can leak through and make the worker compute pnlPct against a stale
+      // entry price, leading to false fast_tp/slow_down/sl triggers.
+      // Concrete bug observed: APE 02/05 12:30 — old BUY at $0.158 (28/04) shadowed the
+      // new BUY at $0.183, causing worker to dispatch fast_tp at "PnL=15.8%" when actual
+      // realized PnL was ≈ -$0.70 net.
+      // This is a workaround. Proper fix in backlog: dedicated /api/agent/positions
+      // endpoint that computes cost basis the same way cron.ts independentCostBasis does
+      // (chronological BUYs - SELLs from Coinbase order history).
+      const STALE_META_MAX_AGE_MS = 24 * 60 * 60 * 1000;  // 24h
+      const now = Date.now();
       const tradeMeta = (await redisGet<Record<string, TradeMetaEntry>>(TRADE_META_KEY)) ?? {};
       const metaBySymbol = new Map<string, { avgBuyPrice: number; buyTimestamp: number }>();
+      let staleSkipped = 0;
       for (const orderId of Object.keys(tradeMeta)) {
         const meta = tradeMeta[orderId];
         if (!meta || meta.type !== "opportunity") continue;
         if (typeof meta.avgBuyPrice !== "number" || typeof meta.buyTimestamp !== "number" || !meta.symbol) continue;
+        if ((now - meta.buyTimestamp) > STALE_META_MAX_AGE_MS) { staleSkipped++; continue; }
         const existing = metaBySymbol.get(meta.symbol);
         if (!existing || meta.buyTimestamp > existing.buyTimestamp) {
           metaBySymbol.set(meta.symbol, {
@@ -216,11 +233,12 @@ export class PositionsTracker {
       this.lastPollAt = Date.now();
       this.lastPollOk = true;
 
-      if (before !== after || this.pollCount === 1) {
+      if (before !== after || this.pollCount === 1 || staleSkipped > 0) {
         logger.info("Positions refreshed", {
           held: after,
           symbols: [...newPositions.keys()].sort().join(","),
           dustSkipped,
+          staleSkipped,
         });
       }
     } catch (err) {
