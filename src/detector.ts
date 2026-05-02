@@ -33,6 +33,17 @@ import { isBlacklisted } from "./blacklist.js";
 import { dispatchEntry, type DispatchSignal } from "./dispatcher.js";
 import { dispatchFastExit, isInFastExitCooldown, type FastExitDispatchPayload } from "./fast-exit-dispatcher.js";
 import type { PositionsTracker } from "./positions.js";
+
+// BACKLOG-3 phase 3 (2026-05-02) — Worker-side kill switch on classical alt_pump dispatches.
+// Mirrors the scan.ts SCAN_ALT_PUMP_BUY_ENABLED flag. The classical 5m/15m/1h
+// classifySignal path produces the same kind of late-entry trades that scan does
+// (HONEY at 11:16 02/05 was dispatched via this path with 5m=15m=1h=5.6%, lost money).
+// Default: disabled (opt-in). Re-enable via env: WORKER_ALT_PUMP_BUY_ENABLED=true.
+// Note: early_pump dispatches (sub-minute) remain ACTIVE — they have a different
+// risk profile because they catch starts not tops.
+// Other signal types (major_crash, position_crash, major_pump, early_pump) are NOT affected.
+const WORKER_ALT_PUMP_BUY_ENABLED = (process.env.WORKER_ALT_PUMP_BUY_ENABLED ?? "false").toLowerCase() === "true";
+const WORKER_ALT_PUMP_DISABLED_COUNTER_KEY = "worker:alt_pump_disabled_count";
 import {
   classifySignal,
   evaluateFastPathCandidate,
@@ -347,9 +358,27 @@ export class Detector {
       // every tick that crosses change1h ≥ 8%) for nothing.
       // Other signal types (major_crash, position_crash, major_pump) need
       // MANAGE involvement and are logged-only for now.
+      //
+      // BACKLOG-3 phase 3 (2026-05-02) — Kill switch via WORKER_ALT_PUMP_BUY_ENABLED.
+      // When disabled (default), classical alt_pump dispatches are short-circuited
+      // BEFORE tryDispatch (no HTTP call to /api/agent/entry). The throttle is
+      // intentionally NOT recorded so a future re-enable doesn't suppress legitimate signals.
       if (result.candidate.signalType === "alt_pump"
           && result.candidate.severity !== "weak") {
-        void this.tryDispatch(result.candidate);
+        if (WORKER_ALT_PUMP_BUY_ENABLED) {
+          void this.tryDispatch(result.candidate);
+        } else {
+          // Log what-if for retrospective analysis (mirrors scan.ts disabled log)
+          const c = result.candidate;
+          logger.info(`[WORKER] ⊘ alt_pump BUY DISABLED (env WORKER_ALT_PUMP_BUY_ENABLED=false) — would have dispatched: ${c.symbol} ${c.severity}${c.triggerSource ? ` via ${c.triggerSource}` : ""} (5m=${c.change5m?.toFixed(1) ?? "n/a"}% 15m=${c.change15m?.toFixed(1) ?? "n/a"}% 1h=${c.change1h?.toFixed(1) ?? "n/a"}% vol=$${(c.volume24h / 1_000_000).toFixed(1)}M)`);
+          // Bump counter for what-if visibility (best-effort)
+          void (async () => {
+            try {
+              const current = (await redisGet<number>(WORKER_ALT_PUMP_DISABLED_COUNTER_KEY)) ?? 0;
+              await redisSet(WORKER_ALT_PUMP_DISABLED_COUNTER_KEY, current + 1);
+            } catch { /* non-fatal */ }
+          })();
+        }
       }
     } else if (result.reason !== "no_signal") {
       this.signalsFiltered++;
