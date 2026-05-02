@@ -51,6 +51,15 @@ export const ALT_PUMP_PCT_5M_STRONG = 3;    // was 2 (2026-04-24)
 export const ALT_PUMP_PCT_5M_MAJOR = 5;     // was 4 (2026-04-24)
 export const MIN_VOLUME_FOR_5M_SIGNAL = 2_000_000;
 
+// BACKLOG-3 phase 3 (2026-05-02) — Scan-side volume sanity ceiling.
+// Coinbase API has been observed returning corrupt volume24h values:
+//   - MOG: 2.68e18 (raw token units without decimals normalization)
+//   - NOICE: $18.9B (still unrealistic for a microcap, dispatched 2026-05-01 → -$11.44 loss)
+// We reject any alt_pump candidate above this ceiling. BTC's legitimate daily volume
+// peaks around $50-100B but BTC pumps go through the dedicated BTC-pump path (not alt_pump),
+// so a $100B ceiling for altcoins is comfortable yet still catches obvious corruption.
+export const ALT_PUMP_MAX_VOLUME_USD = 100_000_000_000; // $100B
+
 // Cumulative run-up guard (added 2026-04-24): if the 4h change is already very high, the pump
 // is likely in its late phase and entering now means catching the top. We reject any alt_pump
 // signal where change4h exceeds this threshold, regardless of the 15m/1h trigger magnitude.
@@ -139,6 +148,15 @@ export const EARLY_ENTRY_MIN_CHANGE2MIN = 2.0;      // %, last 2 minutes
 export const EARLY_ENTRY_ISOLATED_EPS = 0.1;        // %-points
 export const EARLY_ENTRY_MAX_CHANGE5M = 4.0;        // %, must NOT have triggered classical paths
 export const EARLY_ENTRY_MIN_VOLUME_24H = 1_000_000;// $, no shitcoins
+// BACKLOG-3 phase 3 (2026-05-02) — Sanity ceiling on volume24h.
+// Coinbase API occasionally returns corrupt volume values:
+//   - MOG: 2.68e18 (raw token units, missing decimals normalization)
+//   - NOICE: 1.89e10 = $18.9B (still unrealistic for a microcap)
+// Empirical max observed on legitimate altcoin signals over 24h: ~$1.25B (QI).
+// $5B gives a comfortable 4× safety margin while rejecting both bug patterns.
+// Note: this only applies to early-entry evaluation (worker side, microcap-targeted).
+// Scan side keeps a more permissive 100B ceiling to allow BTC-sized assets.
+export const EARLY_ENTRY_MAX_VOLUME_24H = 5_000_000_000; // $5B
 export const EARLY_ENTRY_MIN_DRAWDOWN_PCT = -2.0;   // %, recent peak still close
 export const EARLY_ENTRY_MIN_CHANGE1H = -3.0;       // %, no dead-cat-bounce
 
@@ -419,6 +437,7 @@ export function classifySignal(input: ClassifyInput): ClassifyResult {
   // ─── Priority 3.2: alt_pump via 5m (earliest detection) ───
   else if (!isMajor && change5m !== null && change5m >= ALT_PUMP_PCT_5M_STRONG) {
     if (volume24h < MIN_VOLUME_FOR_5M_SIGNAL) return { kind: "skip", reason: "volume_5m" };
+    if (volume24h >= ALT_PUMP_MAX_VOLUME_USD) return { kind: "skip", reason: "corrupt_volume_5m" };
     if (drawdownThreshold !== null && drawdownFromPeak <= drawdownThreshold) return { kind: "skip", reason: "drawdown_5m" };
     if (change4h !== null && change4h > MAX_CUMULATIVE_RUNUP_4H_PCT) return { kind: "skip", reason: "runup_4h_5m" };
     // Mature pump filter: only meaningful when change1h is significant.
@@ -448,6 +467,7 @@ export function classifySignal(input: ClassifyInput): ClassifyResult {
   // ─── Priority 3.5: alt_pump via 15m (fallback if 5m missed edge or volume<$2M) ───
   else if (!isMajor && change15m !== null && change15m >= ALT_PUMP_PCT_15M_STRONG) {
     if (volume24h < MIN_VOLUME_FOR_15M_SIGNAL) return { kind: "skip", reason: "volume_15m" };
+    if (volume24h >= ALT_PUMP_MAX_VOLUME_USD) return { kind: "skip", reason: "corrupt_volume_15m" };
     if (drawdownThreshold !== null && drawdownFromPeak <= drawdownThreshold) return { kind: "skip", reason: "drawdown_15m" };
     if (change4h !== null && change4h > MAX_CUMULATIVE_RUNUP_4H_PCT) return { kind: "skip", reason: "runup_4h_15m" };
     if (change1h !== null && change1h >= MATURE_PUMP_MIN_1H_PCT
@@ -472,6 +492,7 @@ export function classifySignal(input: ClassifyInput): ClassifyResult {
   // ─── Priority 4: alt_pump via 1h (slow-burn pumps) ───
   else if (!isMajor && change1h !== null && change1h >= ALT_PUMP_PCT_1H_WEAK) {
     if (volume24h < MIN_SIGNAL_VOLUME_USD) return { kind: "skip", reason: "volume_1h" };
+    if (volume24h >= ALT_PUMP_MAX_VOLUME_USD) return { kind: "skip", reason: "corrupt_volume_1h" };
     if (drawdownThreshold !== null && drawdownFromPeak <= drawdownThreshold) return { kind: "skip", reason: "drawdown_1h" };
     if (change4h !== null && change4h > MAX_CUMULATIVE_RUNUP_4H_PCT) return { kind: "skip", reason: "runup_4h_1h" };
     if (change1h >= MATURE_PUMP_MIN_1H_PCT
@@ -759,9 +780,10 @@ export function evaluateEarlyEntry(input: ClassifyInput): EarlyEntryResult {
   if (volume24h < EARLY_ENTRY_MIN_VOLUME_24H) {
     return { isEarly: false, reason: `low_volume:${(volume24h / 1_000_000).toFixed(2)}M` };
   }
-  // Sanity: reject corrupt volume payloads (cf. MOG bug 2026-05-01)
-  if (volume24h >= 100_000_000_000) {
-    return { isEarly: false, reason: "corrupt_volume" };
+  // Sanity: reject corrupt volume payloads (cf. MOG $2.68e18, NOICE $18.9B bug).
+  // Tightened from $100B to $5B (2026-05-02): empirical max on legit signals = ~$1.25B.
+  if (volume24h >= EARLY_ENTRY_MAX_VOLUME_24H) {
+    return { isEarly: false, reason: `corrupt_volume:${(volume24h / 1_000_000_000).toFixed(1)}B` };
   }
   if (drawdownFromPeak <= EARLY_ENTRY_MIN_DRAWDOWN_PCT) {
     return { isEarly: false, reason: `drawdown_too_deep:${drawdownFromPeak.toFixed(1)}%` };
