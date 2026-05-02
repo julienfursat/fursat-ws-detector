@@ -357,7 +357,11 @@ export type SkipReason =
   | "mature_pump_1h"
   | "amplitude_low_5m"
   | "amplitude_low_15m"
-  | "amplitude_low_major_no1h";
+  | "amplitude_low_major_no1h"
+  // BACKLOG-3 phase 3 (2026-05-02) — Coinbase volume24h sanity ceiling rejections
+  | "corrupt_volume_5m"
+  | "corrupt_volume_15m"
+  | "corrupt_volume_1h";
 
 /**
  * Output: either a classified candidate, or a structured skip with reason.
