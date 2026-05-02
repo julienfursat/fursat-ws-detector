@@ -125,6 +125,18 @@ export const FASTPATH_LOG_MIN_CHANGE1H = -3.0;
 // duplicating the classical pumpdetection.
 export const EARLY_ENTRY_MIN_CHANGE30S = 1.0;       // %, last 30 seconds
 export const EARLY_ENTRY_MIN_CHANGE2MIN = 2.0;      // %, last 2 minutes
+// BACKLOG-3 phase 3 (2026-05-02) — Anti "isolated candle" filter.
+// When change30s, change1min and change2min are all within EPS of each other,
+// it means the entire price move happened in the last ~30 seconds and the
+// minutes preceding the entry were flat. Empirical observation on 24h of
+// production data: 5/5 such trades were losses (LA, STRK, DRIFT, FIGHT, QI).
+// These are typically isolated buy-pressure spikes that revert, not the start
+// of a sustained pump (which produces a CRESCENDO pattern instead).
+//
+// Filter formula: reject if |change30s - change2min| < EARLY_ENTRY_ISOLATED_EPS.
+// 0.1 is robust to rounding artifacts but selective enough to keep real
+// crescendo signals (BOBBOB had 30s=1.45, 2m=2.20, diff=0.75 → kept).
+export const EARLY_ENTRY_ISOLATED_EPS = 0.1;        // %-points
 export const EARLY_ENTRY_MAX_CHANGE5M = 4.0;        // %, must NOT have triggered classical paths
 export const EARLY_ENTRY_MIN_VOLUME_24H = 1_000_000;// $, no shitcoins
 export const EARLY_ENTRY_MIN_DRAWDOWN_PCT = -2.0;   // %, recent peak still close
@@ -767,6 +779,19 @@ export function evaluateEarlyEntry(input: ClassifyInput): EarlyEntryResult {
   }
   if (change2min < EARLY_ENTRY_MIN_CHANGE2MIN) {
     return { isEarly: false, reason: `slow_2m:${change2min.toFixed(2)}%` };
+  }
+
+  // BACKLOG-3 phase 3 (2026-05-02) — Anti "isolated candle" guard.
+  // If change30s ≈ change2min (within EARLY_ENTRY_ISOLATED_EPS), the move is
+  // confined to the last 30 seconds and the preceding 90s were flat. Empirically:
+  // 5/5 such trades on 24h of production data were losses (LA/STRK/DRIFT/FIGHT/QI).
+  // True crescendo pumps show change30s noticeably different from change2min
+  // (BOBBOB 30s=1.45, 2m=2.20 → kept; STRK 30s=2.56, 2m=2.56 → rejected).
+  if (Math.abs(change30s - change2min) < EARLY_ENTRY_ISOLATED_EPS) {
+    return {
+      isEarly: false,
+      reason: `isolated_candle:30s=${change30s.toFixed(2)}%≈2m=${change2min.toFixed(2)}%`,
+    };
   }
 
   return {
