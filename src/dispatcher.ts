@@ -123,7 +123,10 @@ export async function dispatchEntry(signal: DispatchSignal): Promise<DispatchRes
   // not double-dispatching. (If response is transient skip, we release after.)
   // BACKLOG-3 phase 3 (2026-05-02) — pass signalType so the right hourly bucket
   // is incremented (alt_pump uses 3/hr cap, early_pump uses 10/hr cap).
-  const throttleSignalType = signal.signalType === "early_pump" ? "early_pump" : "alt_pump";
+  // Note: DispatchSignal["signalType"] is narrowed to 4 classical values, but
+  // tryDispatchEarly casts "early_pump" through this field at runtime. Cast to
+  // string for the comparison so TS doesn't reject the runtime check.
+  const throttleSignalType = (signal.signalType as string) === "early_pump" ? "early_pump" : "alt_pump";
   await recordDispatch(signal.symbol, throttleSignalType);
 
   const payload = { signal };
