@@ -25,6 +25,7 @@
 import { logger } from "./logger.js";
 import { redisGet } from "./redis.js";
 import { coinbaseFetch } from "./coinbase-rest.js";
+import { PnlTracker } from "./pnl-tracker.js";
 
 const TRADE_META_KEY = "agent:trade_meta";
 // BACKLOG-3 phase 3 (2026-05-02) — Reduced from 30_000 to 5_000.
@@ -93,6 +94,24 @@ export class PositionsTracker {
   private lastPollOk = false;
   private pollCount = 0;
   private pollErrors = 0;
+
+  // BACKLOG-3 phase 3.1 (2026-05-02) — Trou B fix: optional pnlTracker reference
+  // so we can prune stale entries (positions closed externally — manual SELL via
+  // Coinbase app, or MANAGE cron SELL — would otherwise leave their pnlMax/pnlMin
+  // entries lingering in the tracker. Next BUY of the same symbol would inherit
+  // the stale pnlMax and trigger fast_ratchet immediately on first tick (drop
+  // from old peak > 3 pts threshold). Wired via setPnlTracker() to keep the
+  // constructor signature unchanged and avoid breaking existing call sites.
+  private pnlTracker: PnlTracker | null = null;
+
+  /**
+   * Wire the PnlTracker that should be pruned whenever positions change.
+   * Optional — if not set, positions tracking works as before but stale entries
+   * may accumulate in the PnlTracker (acceptable degradation).
+   */
+  setPnlTracker(tracker: PnlTracker): void {
+    this.pnlTracker = tracker;
+  }
 
   /**
    * Returns the symbols currently held by the agent (set of strings).
@@ -212,6 +231,16 @@ export class PositionsTracker {
         held: after,
         symbols: [...newPositions.keys()].sort().join(","),
       });
+    }
+
+    // BACKLOG-3 phase 3.1 (2026-05-02) — Trou B fix: prune stale PnlTracker entries.
+    // Positions closed externally (manual SELL via Coinbase app, or MANAGE cron SELL)
+    // would otherwise leave their pnlMax/pnlMin entries in the tracker. A subsequent
+    // BUY of the same symbol would inherit the stale peak and trigger fast_ratchet
+    // on first tick. Pruning on every poll guarantees the tracker mirrors the actual
+    // held set within at most POLL_INTERVAL_MS (5s).
+    if (this.pnlTracker) {
+      this.pnlTracker.pruneToHeld(new Set(newPositions.keys()));
     }
   }
 

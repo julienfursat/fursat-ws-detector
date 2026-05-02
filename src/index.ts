@@ -101,6 +101,13 @@ async function main(): Promise<void> {
   await pnlTracker.loadFromRedis();
   pnlTracker.start();
 
+  // BACKLOG-3 phase 3.1 (2026-05-02) — Trou B fix: wire pnlTracker into positions
+  // so applyNewPositions() prunes stale entries on every poll (5s) instead of
+  // waiting for the 5-min stats timer (line 141 below). Tightens the window
+  // during which a same-symbol re-BUY could inherit a stale pnlMax from the
+  // previous position and trigger a false fast_ratchet on the first tick.
+  positions.setPnlTracker(pnlTracker);
+
   // 8. Detector (BUY entry as in 2B)
   // BACKLOG-3 phase 3 (2026-05-02) — Pass positions to the detector so that
   // tryDispatchSlowDown uses the same source of truth as fast-exit-evaluator.
