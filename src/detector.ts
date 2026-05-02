@@ -32,6 +32,7 @@ import { checkThrottle } from "./throttle.js";
 import { isBlacklisted } from "./blacklist.js";
 import { dispatchEntry, type DispatchSignal } from "./dispatcher.js";
 import { dispatchFastExit, isInFastExitCooldown, type FastExitDispatchPayload } from "./fast-exit-dispatcher.js";
+import type { PositionsTracker } from "./positions.js";
 import {
   classifySignal,
   evaluateFastPathCandidate,
@@ -167,6 +168,14 @@ export class Detector {
   private ringBuffers: RingBuffers;
   private tradableSymbols: Set<string>;
   private heldSymbolsProvider: () => Set<string>;
+  // BACKLOG-3 phase 3 (2026-05-02) — Optional positions reference, used by
+  // tryDispatchSlowDown to compute pnlPct directly from the tracked position
+  // instead of doing an independent getAvgBuyPrice lookup. When provided, this
+  // avoids the 60s null-cache pitfall and stays synchronized with the same
+  // source of truth as fast-exit-evaluator (which has worked correctly).
+  // Optional for backwards compatibility — when absent, slow-down evaluation
+  // falls back to the legacy getAvgBuyPrice path.
+  private positions: PositionsTracker | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
 
   // Pending log entries (flushed every FLUSH_INTERVAL_MS)
@@ -211,11 +220,13 @@ export class Detector {
   constructor(
     ringBuffers: RingBuffers,
     tradableSymbols: Set<string>,
-    heldSymbolsProvider: () => Set<string>
+    heldSymbolsProvider: () => Set<string>,
+    positions?: PositionsTracker,
   ) {
     this.ringBuffers = ringBuffers;
     this.tradableSymbols = tradableSymbols;
     this.heldSymbolsProvider = heldSymbolsProvider;
+    this.positions = positions ?? null;
   }
 
   /**
@@ -763,11 +774,30 @@ export class Detector {
       return;
     }
 
-    // Need avgBuyPrice — async but cached
-    const avgBuyPrice = await this.getAvgBuyPrice(symbol);
-    if (avgBuyPrice == null || avgBuyPrice <= 0) return;
+    // BACKLOG-3 phase 3 (2026-05-02) — Use the SAME source of truth as
+    // fast-exit-evaluator (positions.updatePriceForSymbol). Previously we used a
+    // separate getAvgBuyPrice() with its own cache, which had a 60s null-cache
+    // bug: if the first lookup happened before agent:trade_meta was propagated
+    // (right after a worker BUY), null was cached for 60s, blocking slow-down
+    // evaluation during the entire pump window of 2-5min trades. By using
+    // positions.updatePriceForSymbol() we get pnlPct already computed and
+    // synchronized with the rest of the worker.
+    let pnlPct: number;
+    let avgBuyPrice: number;
+    if (this.positions) {
+      const pos = this.positions.updatePriceForSymbol(symbol, snap.currentPrice);
+      if (!pos) return;  // not held according to positions tracker
+      pnlPct = pos.pnlPct;
+      avgBuyPrice = pos.avgBuyPrice;
+    } else {
+      // Legacy fallback path (kept for backwards compat — should not be used
+      // in production once worker-index passes positions to the constructor).
+      const legacyAvg = await this.getAvgBuyPrice(symbol);
+      if (legacyAvg == null || legacyAvg <= 0) return;
+      avgBuyPrice = legacyAvg;
+      pnlPct = ((snap.currentPrice - avgBuyPrice) / avgBuyPrice) * 100;
+    }
 
-    const pnlPct = ((snap.currentPrice - avgBuyPrice) / avgBuyPrice) * 100;
     const verdict = evaluateSlowDownExit({
       pnlPct,
       change30s: snap.change30s,

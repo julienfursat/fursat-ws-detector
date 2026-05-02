@@ -102,8 +102,12 @@ async function main(): Promise<void> {
   pnlTracker.start();
 
   // 8. Detector (BUY entry as in 2B)
+  // BACKLOG-3 phase 3 (2026-05-02) — Pass positions to the detector so that
+  // tryDispatchSlowDown uses the same source of truth as fast-exit-evaluator.
+  // This fixes the bug where slow-down/tp/sl never triggered (getAvgBuyPrice
+  // had a 60s null-cache pitfall when called right after a worker BUY).
   const heldSymbolsProvider = (): Set<string> => positions.getHeldSymbols();
-  const detector = new Detector(ringBuffers, symbols, heldSymbolsProvider);
+  const detector = new Detector(ringBuffers, symbols, heldSymbolsProvider, positions);
   detector.start();
 
   // 9. Fast-exit evaluator (real-time SELL on every tick of held assets)
