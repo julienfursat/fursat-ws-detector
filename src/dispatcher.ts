@@ -121,7 +121,10 @@ export async function dispatchEntry(signal: DispatchSignal): Promise<DispatchRes
   // Record dispatch in shared throttle BEFORE the HTTP call. If the call
   // fails or times out, the throttle stays — better to err on the side of
   // not double-dispatching. (If response is transient skip, we release after.)
-  await recordDispatch(signal.symbol);
+  // BACKLOG-3 phase 3 (2026-05-02) — pass signalType so the right hourly bucket
+  // is incremented (alt_pump uses 3/hr cap, early_pump uses 10/hr cap).
+  const throttleSignalType = signal.signalType === "early_pump" ? "early_pump" : "alt_pump";
+  await recordDispatch(signal.symbol, throttleSignalType);
 
   const payload = { signal };
 

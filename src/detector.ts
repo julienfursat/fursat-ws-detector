@@ -654,7 +654,7 @@ export class Detector {
     this.inFlightDispatches.add(symbol);
 
     try {
-      const throttleCheck = await checkThrottle(symbol);
+      const throttleCheck = await checkThrottle(symbol, "early_pump");
       if (!throttleCheck.allowed) {
         this.dispatchPreCheckFailed.throttle++;
         this.recordEarlyDispatch(now, this.candidateToInput(c), true, earlyReason, false, `throttle:${throttleCheck.reason}`);
