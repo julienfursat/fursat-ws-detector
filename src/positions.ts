@@ -36,6 +36,14 @@ const TRADE_META_KEY = "agent:trade_meta";
 // 1 paginated /accounts call per 5s ≈ 0.2 req/s.
 const POLL_INTERVAL_MS = 5_000;
 
+// BACKLOG-3 phase 3 (2026-05-02) — Vercel /api/agent/positions integration.
+// Authoritative cost basis source. The endpoint computes independentCostBasis
+// the same way cron.ts does (chronological BUYs - SELLs from Coinbase order
+// history). Timeout is conservative — Vercel typically responds in 200-800ms
+// (cache hit ~50ms, cache miss ~500-1000ms with Coinbase round-trips).
+// 5s gives margin for cold-start while keeping the 5s poll cadence honest.
+const VERCEL_POSITIONS_TIMEOUT_MS = 5_000;
+
 // Symbols that are NEVER opportunity positions (BTC/ETH are core holdings)
 const MAJORS = new Set(["BTC", "ETH"]);
 const STABLES = new Set([
@@ -144,108 +152,182 @@ export class PositionsTracker {
   }
 
   /**
-   * Single poll cycle: fetch all accounts (paginated), read trade_meta,
-   * rebuild the positions map.
+   * Single poll cycle.
+   *
+   * BACKLOG-3 phase 3 (2026-05-02) — Authoritative cost basis from Vercel.
+   * Primary path: fetch /api/agent/positions which computes independentCostBasis
+   * the same way cron.ts does (chronological BUYs - SELLs from Coinbase order history).
+   * This is the single source of truth for cost basis and avoids the trade_meta
+   * pitfalls (append-only history shadowing, race conditions, missed manual SELLs).
+   *
+   * Fallback path: if Vercel is unavailable, use the legacy trade_meta logic
+   * with a stale-meta guard (24h cutoff) so we keep functioning even if /api/agent/positions
+   * is down. The fallback is less accurate (still has the multi-BUY DCA shadowing issue)
+   * but ensures resilience.
    */
   private async pollNow(): Promise<void> {
     this.pollCount++;
     try {
-      // 1. Fetch all Coinbase accounts (paginated)
-      const accounts = await this.fetchAllAccounts();
-      const accountsBySymbol = new Map<string, { available: number; total: number }>();
-      for (const acc of accounts) {
-        const symbol = acc.currency;
-        if (!symbol) continue;
-        if (MAJORS.has(symbol)) continue;
-        if (STABLES.has(symbol)) continue;
-        const available = parseFloat(acc.available_balance?.value ?? "0");
-        const hold = parseFloat(acc.hold?.value ?? "0");
-        const total = available + hold;
-        if (total <= 0) continue;
-        accountsBySymbol.set(symbol, { available, total });
+      const newPositions = await this.pollFromVercel();
+      if (newPositions !== null) {
+        this.applyNewPositions(newPositions, "vercel");
+        return;
       }
-
-      // 2. Read trade_meta from Redis, aggregate by symbol (most recent BUY per symbol).
-      //
-      // BACKLOG-3 phase 3 (2026-05-02) — Stale-meta guard.
-      // Reject trade_meta entries whose buyTimestamp is older than STALE_META_MAX_AGE_MS.
-      // Rationale: trade_meta is append-only (BUYs are never deleted, even after a full SELL).
-      // If we re-buy an asset days/weeks after a previous full liquidation, the OLD
-      // avgBuyPrice can leak through and make the worker compute pnlPct against a stale
-      // entry price, leading to false fast_tp/slow_down/sl triggers.
-      // Concrete bug observed: APE 02/05 12:30 — old BUY at $0.158 (28/04) shadowed the
-      // new BUY at $0.183, causing worker to dispatch fast_tp at "PnL=15.8%" when actual
-      // realized PnL was ≈ -$0.70 net.
-      // This is a workaround. Proper fix in backlog: dedicated /api/agent/positions
-      // endpoint that computes cost basis the same way cron.ts independentCostBasis does
-      // (chronological BUYs - SELLs from Coinbase order history).
-      const STALE_META_MAX_AGE_MS = 24 * 60 * 60 * 1000;  // 24h
-      const now = Date.now();
-      const tradeMeta = (await redisGet<Record<string, TradeMetaEntry>>(TRADE_META_KEY)) ?? {};
-      const metaBySymbol = new Map<string, { avgBuyPrice: number; buyTimestamp: number }>();
-      let staleSkipped = 0;
-      for (const orderId of Object.keys(tradeMeta)) {
-        const meta = tradeMeta[orderId];
-        if (!meta || meta.type !== "opportunity") continue;
-        if (typeof meta.avgBuyPrice !== "number" || typeof meta.buyTimestamp !== "number" || !meta.symbol) continue;
-        if ((now - meta.buyTimestamp) > STALE_META_MAX_AGE_MS) { staleSkipped++; continue; }
-        const existing = metaBySymbol.get(meta.symbol);
-        if (!existing || meta.buyTimestamp > existing.buyTimestamp) {
-          metaBySymbol.set(meta.symbol, {
-            avgBuyPrice: meta.avgBuyPrice,
-            buyTimestamp: meta.buyTimestamp,
-          });
-        }
-      }
-
-      // 3. Build the new positions map: held symbols ∩ has-trade-meta ∩ not-dust
-      const newPositions = new Map<string, AgentPosition>();
-      let dustSkipped = 0;
-      for (const [symbol, account] of accountsBySymbol.entries()) {
-        const meta = metaBySymbol.get(symbol);
-        if (!meta) continue; // legacy position, not surveilled by worker
-        // Preserve the previous currentPrice if we have one (next tick will refresh).
-        // If first time we see this position, currentPrice = avgBuyPrice as placeholder.
-        const prev = this.positions.get(symbol);
-        const currentPrice = prev?.currentPrice ?? meta.avgBuyPrice;
-        const valueUSD = account.available * currentPrice;
-        // Skip dust positions — residual balances Coinbase couldn't clear after SELL.
-        // These would compute nonsense PnL against ancient avgBuyPrice.
-        if (valueUSD < DUST_THRESHOLD_USD) {
-          dustSkipped++;
-          continue;
-        }
-        const pnlPct = ((currentPrice - meta.avgBuyPrice) / meta.avgBuyPrice) * 100;
-        newPositions.set(symbol, {
-          symbol,
-          units: account.available,
-          currentPrice,
-          avgBuyPrice: meta.avgBuyPrice,
-          buyTimestamp: meta.buyTimestamp,
-          pnlPct,
-          valueUSD,
-        });
-      }
-
-      const before = this.positions.size;
-      this.positions = newPositions;
-      const after = this.positions.size;
-      this.lastPollAt = Date.now();
-      this.lastPollOk = true;
-
-      if (before !== after || this.pollCount === 1 || staleSkipped > 0) {
-        logger.info("Positions refreshed", {
-          held: after,
-          symbols: [...newPositions.keys()].sort().join(","),
-          dustSkipped,
-          staleSkipped,
-        });
-      }
+      // Vercel returned null = unavailable. Fall back to trade_meta logic.
+      logger.warn("Vercel /api/agent/positions unavailable, falling back to trade_meta");
+      const fallbackPositions = await this.pollFromTradeMeta();
+      this.applyNewPositions(fallbackPositions, "trade_meta_fallback");
     } catch (err) {
       this.pollErrors++;
       this.lastPollOk = false;
       logger.warn("Positions poll failed", { err: (err as Error).message });
     }
+  }
+
+  /**
+   * Apply a new positions map (from any source). Preserves previously-known
+   * currentPrice across refreshes so we don't reset to the avgBuyPrice placeholder
+   * on every poll (the WS evaluator updates it tick-by-tick anyway).
+   */
+  private applyNewPositions(newPositions: Map<string, AgentPosition>, source: string): void {
+    // Carry over currentPrice from previous map if available
+    for (const [symbol, pos] of newPositions.entries()) {
+      const prev = this.positions.get(symbol);
+      if (prev?.currentPrice) {
+        pos.currentPrice = prev.currentPrice;
+        pos.pnlPct = ((prev.currentPrice - pos.avgBuyPrice) / pos.avgBuyPrice) * 100;
+        pos.valueUSD = pos.units * prev.currentPrice;
+      }
+    }
+
+    const before = this.positions.size;
+    this.positions = newPositions;
+    const after = this.positions.size;
+    this.lastPollAt = Date.now();
+    this.lastPollOk = true;
+
+    if (before !== after || this.pollCount === 1) {
+      logger.info("Positions refreshed", {
+        source,
+        held: after,
+        symbols: [...newPositions.keys()].sort().join(","),
+      });
+    }
+  }
+
+  /**
+   * Primary path: fetch authoritative positions from Vercel /api/agent/positions.
+   * Returns null if the endpoint is unreachable (so caller can fall back).
+   * Returns an empty map if the endpoint is reachable but reports no positions
+   * (legitimate "no agent positions held" state).
+   */
+  private async pollFromVercel(): Promise<Map<string, AgentPosition> | null> {
+    const baseUrl = (process.env.FURSAT_API_BASE ?? "https://www.fursat.net").replace(/\/$/, "");
+    const secret = process.env.CRYPTO_AGENT_SECRET ?? "";
+    if (!secret) {
+      // Without a secret we can't authenticate. Skip primary, go to fallback.
+      return null;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), VERCEL_POSITIONS_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${baseUrl}/api/agent/positions`, {
+        method: "GET",
+        headers: { "x-agent-secret": secret },
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        logger.warn("Vercel /positions HTTP error", { status: res.status });
+        return null;
+      }
+      const data: any = await res.json();
+      const positionsMap = new Map<string, AgentPosition>();
+      const remote = data.positions ?? {};
+      for (const symbol of Object.keys(remote)) {
+        const r = remote[symbol];
+        if (!r || typeof r.units !== "number" || typeof r.avgBuyPrice !== "number") continue;
+        if (r.units <= 0 || r.avgBuyPrice <= 0) continue;
+        // Use avgBuyPrice as the placeholder current price; per-tick updates will refresh it.
+        positionsMap.set(symbol, {
+          symbol,
+          units: r.units,
+          currentPrice: r.avgBuyPrice,
+          avgBuyPrice: r.avgBuyPrice,
+          buyTimestamp: r.lastBuyTs ?? Date.now(),
+          pnlPct: 0,
+          valueUSD: r.valueUSD ?? (r.units * r.avgBuyPrice),
+        });
+      }
+      return positionsMap;
+    } catch (err) {
+      clearTimeout(timeoutId);
+      logger.warn("Vercel /positions fetch failed", { err: (err as Error).message });
+      return null;
+    }
+  }
+
+  /**
+   * Fallback path: legacy trade_meta logic with stale-meta guard.
+   * Used when Vercel /api/agent/positions is unreachable.
+   * Less accurate (multi-BUY shadowing remains) but keeps the worker functional.
+   */
+  private async pollFromTradeMeta(): Promise<Map<string, AgentPosition>> {
+    // 1. Fetch all Coinbase accounts (paginated)
+    const accounts = await this.fetchAllAccounts();
+    const accountsBySymbol = new Map<string, { available: number; total: number }>();
+    for (const acc of accounts) {
+      const symbol = acc.currency;
+      if (!symbol) continue;
+      if (MAJORS.has(symbol)) continue;
+      if (STABLES.has(symbol)) continue;
+      const available = parseFloat(acc.available_balance?.value ?? "0");
+      const hold = parseFloat(acc.hold?.value ?? "0");
+      const total = available + hold;
+      if (total <= 0) continue;
+      accountsBySymbol.set(symbol, { available, total });
+    }
+
+    // 2. Read trade_meta with stale-meta guard (24h cutoff) — workaround for the
+    // append-only-history shadowing bug. The /api/agent/positions endpoint is the
+    // proper fix; this is the resilience-fallback only.
+    const STALE_META_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const tradeMeta = (await redisGet<Record<string, TradeMetaEntry>>(TRADE_META_KEY)) ?? {};
+    const metaBySymbol = new Map<string, { avgBuyPrice: number; buyTimestamp: number }>();
+    for (const orderId of Object.keys(tradeMeta)) {
+      const meta = tradeMeta[orderId];
+      if (!meta || meta.type !== "opportunity") continue;
+      if (typeof meta.avgBuyPrice !== "number" || typeof meta.buyTimestamp !== "number" || !meta.symbol) continue;
+      if ((now - meta.buyTimestamp) > STALE_META_MAX_AGE_MS) continue;
+      const existing = metaBySymbol.get(meta.symbol);
+      if (!existing || meta.buyTimestamp > existing.buyTimestamp) {
+        metaBySymbol.set(meta.symbol, {
+          avgBuyPrice: meta.avgBuyPrice,
+          buyTimestamp: meta.buyTimestamp,
+        });
+      }
+    }
+
+    // 3. Build the new positions map: held symbols ∩ has-trade-meta ∩ not-dust
+    const newPositions = new Map<string, AgentPosition>();
+    for (const [symbol, account] of accountsBySymbol.entries()) {
+      const meta = metaBySymbol.get(symbol);
+      if (!meta) continue;
+      const valueUSD = account.available * meta.avgBuyPrice;
+      if (valueUSD < DUST_THRESHOLD_USD) continue;
+      newPositions.set(symbol, {
+        symbol,
+        units: account.available,
+        currentPrice: meta.avgBuyPrice,
+        avgBuyPrice: meta.avgBuyPrice,
+        buyTimestamp: meta.buyTimestamp,
+        pnlPct: 0,
+        valueUSD,
+      });
+    }
+    return newPositions;
   }
 
   /**
