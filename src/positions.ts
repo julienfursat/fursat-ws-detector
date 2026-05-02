@@ -27,7 +27,14 @@ import { redisGet } from "./redis.js";
 import { coinbaseFetch } from "./coinbase-rest.js";
 
 const TRADE_META_KEY = "agent:trade_meta";
-const POLL_INTERVAL_MS = 30_000;
+// BACKLOG-3 phase 3 (2026-05-02) — Reduced from 30_000 to 5_000.
+// The 30s interval created up to 30s of "blind window" right after a worker BUY,
+// during which fast_slow_down/fast_tp/fast_sl rules could not evaluate (the asset
+// wasn't yet in the positions map). At 5s, this window shrinks to ≤5s, giving
+// sub-min rules effective coverage on short-lived trades (BOBBOB/QI/RLS/SYND-style,
+// 2-5min duration). Coinbase rate limit (30 req/s) is comfortably respected:
+// 1 paginated /accounts call per 5s ≈ 0.2 req/s.
+const POLL_INTERVAL_MS = 5_000;
 
 // Symbols that are NEVER opportunity positions (BTC/ETH are core holdings)
 const MAJORS = new Set(["BTC", "ETH"]);
