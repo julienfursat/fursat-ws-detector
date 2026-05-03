@@ -160,6 +160,49 @@ export const EARLY_ENTRY_MAX_VOLUME_24H = 5_000_000_000; // $5B
 export const EARLY_ENTRY_MIN_DRAWDOWN_PCT = -2.0;   // %, recent peak still close
 export const EARLY_ENTRY_MIN_CHANGE1H = -3.0;       // %, no dead-cat-bounce
 
+// ─── PUMP-1H ENTRY (NEW 2026-05-03) ───────────────────────────────────────────
+// Detects sustained pumps (30-60min duration) that the EARLY_ENTRY path rejects.
+// Rationale: the EARLY_ENTRY filter "change5m < 4%" rejects assets that have
+// already moved 5%+ in the last 5min, even when they're in the middle of a
+// long pump that will continue. Empirical example: TROLL on 2026-05-03 made
+// +69% in 24h but was rejected 949 times in 15min by the worker because
+// change5m was 4-7% (queue of pump in worker's view, not the start). Result:
+// missed the entire pump.
+//
+// Strategy: a SECOND, ADDITIVE detection path that targets pumps already in
+// progress (visible on 1h window) but still climbing (positive on 5m window).
+// This is NOT a replacement for EARLY_ENTRY — it captures a different pump
+// regime (sustained vs flash). The two paths run in parallel and are NEVER
+// in conflict (a candidate either matches the early-flash pattern OR the
+// sustained-pump pattern, but rarely both due to the change5m thresholds).
+//
+// Activation rule: change1h ≥ 10% AND change15m ≥ 4% AND change5m ≥ 0%
+//                  AND volume24h ∈ [$1M, $5B] AND drawdownFromPeak > -5% AND !isHeld.
+//
+// Why these thresholds:
+//   - change1h ≥ 10% : strong sustained move on the 1h window (avoids small drifts)
+//   - change15m ≥ 4% : confirmed momentum on the 15min window (not a 1h artifact)
+//   - change5m ≥ 0%  : NOT in retracement at the moment of entry (avoids buying tops)
+//   - drawdown > -5% : tolerate slightly more drawdown than EARLY (-2%) since pump is older
+//
+// Cap & throttle: 5/h hourly cap (permissive for initial calibration), 60min
+// per-asset throttle (vs 30min for EARLY because pump-1h pumps last longer
+// and we should not multi-buy the same asset within one pump cycle).
+//
+// Exit rules: dispatched with type="opportunity-pump1h" so fast-exit-evaluator
+// can apply DEDICATED thresholds (fast_tp +15%, ratchet drawdown 5pt fixed)
+// instead of the sub-min thresholds (fast_tp +5%, asymmetric ratchet).
+//
+// Killswitch: WORKER_PUMP1H_BUY_ENABLED env var (default false until validated
+// on 20+ samples). When false, evaluatePump1hEntry returns isPump1h=false
+// with reason="killswitch_disabled".
+export const PUMP1H_MIN_CHANGE1H = 10.0;           // %, sustained 1h move required
+export const PUMP1H_MIN_CHANGE15M = 4.0;           // %, confirmed 15min momentum
+export const PUMP1H_MIN_CHANGE5M = 0.0;            // %, NOT currently retracing
+export const PUMP1H_MIN_VOLUME_24H = 1_000_000;    // $, same minimum as EARLY
+export const PUMP1H_MAX_VOLUME_24H = 5_000_000_000; // $5B, same sanity ceiling as EARLY
+export const PUMP1H_MIN_DRAWDOWN_PCT = -5.0;       // %, more permissive than EARLY (-2%)
+
 // ─── SLOW DOWN EXIT sub-1min (BACKLOG-3 phase 2 — 2026-05-01) ──────────────────
 // Sells when the pump is still positive but the velocity is collapsing.
 // Rationale: waiting for change30s ≤ 0% means we already lost 0.5-1% from the
@@ -823,6 +866,91 @@ export function evaluateEarlyEntry(input: ClassifyInput): EarlyEntryResult {
   return {
     isEarly: true,
     reason: `early_pump: 30s=${change30s.toFixed(2)}% 2m=${change2min.toFixed(2)}% 5m=${change5m?.toFixed(2) ?? "n/a"}%`,
+  };
+}
+
+// ═════ PUMP-1H ENTRY (NEW 2026-05-03) ═════════════════════════════════════════
+// Sustained-pump detector. Additive to evaluateEarlyEntry — runs in parallel,
+// catches pumps that EARLY_ENTRY rejects due to change5m ≥ 4% filter.
+// See PUMP1H_* constants block above for full rationale.
+
+export interface Pump1hEntryResult {
+  /** Le candidate doit être dispatché en pump-1h */
+  isPump1h: boolean;
+  /** Tag explicatif pour les logs */
+  reason: string;
+}
+
+/**
+ * Évalue si un tick correspond à un pump 1h en cours qui mérite une entrée.
+ *
+ * Pure : aucun I/O, pas de Redis, pas de fetch. Le caller (worker) gère
+ * killswitch (WORKER_PUMP1H_BUY_ENABLED), throttle per-asset, hourly cap.
+ *
+ * Conditions (toutes doivent être vraies) :
+ *   - change1h  ≥ PUMP1H_MIN_CHANGE1H        (10%)
+ *   - change15m ≥ PUMP1H_MIN_CHANGE15M       (4%)
+ *   - change5m  ≥ PUMP1H_MIN_CHANGE5M        (0%, n'est PAS en retracement)
+ *   - volume24h ∈ [PUMP1H_MIN_VOLUME_24H, PUMP1H_MAX_VOLUME_24H]
+ *   - drawdownFromPeak > PUMP1H_MIN_DRAWDOWN_PCT (-5%)
+ *   - !isHeld
+ *
+ * NB: pas de check anti-isolated-candle car le pattern est différent
+ * (isolated-candle est un signal sub-minute qui ne s'applique pas à 1h).
+ *
+ * NB2: pas de check change30s/change1m/change2min — un pump-1h peut être
+ * détecté même si la dernière minute est calme (consolidation intra-pump).
+ * Le risque est contrebalancé par le fait que change5m ≥ 0% garantit qu'on
+ * n'achète pas dans une chute brutale.
+ */
+export function evaluatePump1hEntry(input: ClassifyInput): Pump1hEntryResult {
+  const {
+    change5m, change15m, change1h, volume24h, isHeld, drawdownFromPeak, symbol,
+  } = input;
+
+  // Stables and majors never qualify (defensive)
+  if (STABLES.has(symbol) || MAJORS.has(symbol)) {
+    return { isPump1h: false, reason: "stable_or_major" };
+  }
+  if (isHeld) {
+    return { isPump1h: false, reason: "already_held" };
+  }
+  // Volume sanity
+  if (volume24h < PUMP1H_MIN_VOLUME_24H) {
+    return { isPump1h: false, reason: `low_volume:${(volume24h / 1_000_000).toFixed(2)}M` };
+  }
+  if (volume24h >= PUMP1H_MAX_VOLUME_24H) {
+    return { isPump1h: false, reason: `corrupt_volume:${(volume24h / 1_000_000_000).toFixed(1)}B` };
+  }
+  // Drawdown — more permissive than EARLY (-5% vs -2%) because pumps that have
+  // run for 30-60min legitimately have larger drawdowns from their peak
+  if (drawdownFromPeak <= PUMP1H_MIN_DRAWDOWN_PCT) {
+    return { isPump1h: false, reason: `drawdown_too_deep:${drawdownFromPeak.toFixed(1)}%` };
+  }
+  // Required windows must exist (1h and 15m are mandatory for this detector)
+  if (change1h === null) {
+    return { isPump1h: false, reason: "no_1h_data" };
+  }
+  if (change15m === null) {
+    return { isPump1h: false, reason: "no_15m_data" };
+  }
+  if (change5m === null) {
+    return { isPump1h: false, reason: "no_5m_data" };
+  }
+  // Core triggers
+  if (change1h < PUMP1H_MIN_CHANGE1H) {
+    return { isPump1h: false, reason: `weak_1h:c1h=${change1h.toFixed(1)}%` };
+  }
+  if (change15m < PUMP1H_MIN_CHANGE15M) {
+    return { isPump1h: false, reason: `weak_15m:c15m=${change15m.toFixed(1)}%` };
+  }
+  if (change5m < PUMP1H_MIN_CHANGE5M) {
+    return { isPump1h: false, reason: `retracing_5m:c5m=${change5m.toFixed(1)}%` };
+  }
+
+  return {
+    isPump1h: true,
+    reason: `pump1h: 1h=${change1h.toFixed(1)}% 15m=${change15m.toFixed(1)}% 5m=${change5m.toFixed(1)}%`,
   };
 }
 
