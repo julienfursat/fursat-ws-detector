@@ -221,6 +221,40 @@ export const FAST_TP_PNL_PCT = 5.0;                 // pnl_pct that triggers imm
 export const FAST_SL_CHANGE30S_PCT = -1.0;          // change30s that triggers safety stop
 export const FAST_SL_MIN_PNL_PCT = -3.0;            // only fire fast_sl if pnl is not already disaster
 
+// ─── PUMP-1H DEDICATED EXIT THRESHOLDS (NEW 2026-05-03) ────────────────────────
+// Sustained pumps (TROLL +69%/24h, AI +26%/24h on 03/05) need different exit
+// management than sub-min flash pumps. Sub-min thresholds (fast_tp +5%, asymmetric
+// ratchet 3pt/5pt) sell too early on these, capturing only $2-5 on trades that
+// could have given $20-30. Dedicated exit rules are the second half of the
+// pump-1h equation (the detector is just the entry side).
+//
+// FAST_TP_PUMP1H_PNL_PCT = 15
+//   Captures the realistic net gain on a sustained pump. Below +15%, the ratchet
+//   handles trailing protection. Above +15%, fast_tp guarantees we lock in
+//   a meaningful win even if we missed the ratchet trigger.
+//
+// FAST_RATCHET_PUMP1H_PNL_MAX_TRIGGER = 5
+//   Lower armement threshold than the standard 8% — pump-1h pumps that don't reach
+//   +8% pnl_max would otherwise NEVER trigger the ratchet (would dérive jusqu'au
+//   fast_no_pump_exit à -2.9% net après fees+slippage). At 5% armement the ratchet
+//   becomes useful for pumps that peak at 6-8% (frequent in practice).
+//
+// FAST_RATCHET_PUMP1H_DRAWDOWN_PTS = 4
+//   Fixed 4pt drawdown (not asymmetric). Combined with armement at +5%:
+//     - Pic +6%, sortie à +2%, net après 2.9% costs = -0.9% → small loss
+//     - Pic +7%, sortie à +3%, net après 2.9% costs = +0.1% → breakeven
+//     - Pic +10%, sortie à +6%, net après 2.9% costs = +3.1% → +$2.48 sur $80
+//     - Pic +15%, fast_tp triggers → net +12.1% → +$9.68 sur $80
+//   Breakeven net atteint dès que pic ≥ +6.9% gross.
+//
+// Sub-min FAST_SL stays applicable to pump-1h positions (still a useful safety
+// net on violent reversals). FAST_SLOW_DOWN is also applicable but with the
+// pnlPct threshold raised so it doesn't fire too early on legitimate consolidation.
+export const FAST_TP_PUMP1H_PNL_PCT = 15.0;          // pump1h-specific take-profit threshold
+export const FAST_RATCHET_PUMP1H_PNL_MAX_TRIGGER = 5.0;  // pump1h-specific armement (vs 8.0 for sub-min)
+export const FAST_RATCHET_PUMP1H_DRAWDOWN_PTS = 4.0; // pump1h-specific fixed drawdown (no asymmetric)
+export const SLOW_DOWN_PUMP1H_MIN_PNL_PCT = 8.0;     // pump1h-specific slow-down min PnL (vs 2.0% for sub-min)
+
 // ═════ CONSTANTES — SEUILS DE CRASH / MAJORS ═════════════════════════════════
 
 // Crash thresholds on open positions (altcoins held in portfolio)
@@ -351,6 +385,13 @@ export interface AgentPosition {
   pnlPct: number;             // computed here
   valueUSD: number;           // units * currentPrice
   source: "trade_meta" | "legacy_orders";  // which path populated avgBuyPrice/buyTimestamp
+  // PUMP-1H DETECTOR (NEW 2026-05-03) — Optional dispatch source to route exit
+  // rules. When "worker-pump1h", evaluateFastExitRules and evaluateSlowDownExit
+  // use the dedicated pump1h thresholds (FAST_TP_PUMP1H_PNL_PCT=15,
+  // FAST_RATCHET_PUMP1H_PNL_MAX_TRIGGER=5, FAST_RATCHET_PUMP1H_DRAWDOWN_PTS=4 fixed).
+  // When undefined or any other value, falls back to the standard sub-min
+  // thresholds (no behavioral change on existing early_pump positions).
+  dispatchSource?: string;
 }
 
 // ═════ CLASSIFICATION DES SIGNAUX (fonction pure) ════════════════════════════
@@ -670,11 +711,23 @@ export function evaluateFastExitRules(
     return { reasonCode: "fast_no_pump_exit", priority: 1.7, change1h, change15m, change30min };
   }
 
-  // Rule 2: FAST RATCHET — asymmetric drawdown threshold
-  if (pnlMax !== undefined && pnlMax >= FAST_EXIT_RATCHET_PNL_MAX_TRIGGER) {
-    const drawdownPts = pnlMax >= FAST_EXIT_RATCHET_ASYMMETRIC_THRESHOLD
-      ? FAST_EXIT_RATCHET_DRAWDOWN_PTS_HIGH
-      : FAST_EXIT_RATCHET_DRAWDOWN_PTS_LOW;
+  // Rule 2: FAST RATCHET — asymmetric drawdown threshold (or fixed for pump-1h)
+  // PUMP-1H DETECTOR (NEW 2026-05-03): pump-1h positions use BOTH a lower armement
+  // threshold (+5% vs +8%) AND a fixed 4pt drawdown (vs asymmetric 3/5pt). This
+  // is critical: with armement at +8%, pumps peaking at 5-7% never trigger the
+  // ratchet and dérive jusqu'au fast_no_pump_exit (loss ~$2 fees). Lowering
+  // armement to +5% makes the ratchet useful for the common case of moderate
+  // pumps. Standard early_pump positions keep the asymmetric behavior (no regression).
+  const isPump1h = position.dispatchSource === "worker-pump1h";
+  const ratchetTrigger = isPump1h
+    ? FAST_RATCHET_PUMP1H_PNL_MAX_TRIGGER
+    : FAST_EXIT_RATCHET_PNL_MAX_TRIGGER;
+  if (pnlMax !== undefined && pnlMax >= ratchetTrigger) {
+    const drawdownPts = isPump1h
+      ? FAST_RATCHET_PUMP1H_DRAWDOWN_PTS
+      : (pnlMax >= FAST_EXIT_RATCHET_ASYMMETRIC_THRESHOLD
+        ? FAST_EXIT_RATCHET_DRAWDOWN_PTS_HIGH
+        : FAST_EXIT_RATCHET_DRAWDOWN_PTS_LOW);
     if (position.pnlPct <= (pnlMax - drawdownPts)) {
       return { reasonCode: "fast_ratchet", priority: 2, change1h, change15m, change30min };
     }
@@ -966,6 +1019,16 @@ export interface SlowDownExitContext {
   change30s: number | null;
   change1min: number | null;
   change2min: number | null;
+  /**
+   * PUMP-1H DETECTOR (NEW 2026-05-03) — Optional dispatch source.
+   * When "worker-pump1h", uses dedicated thresholds:
+   *   - fast_tp triggers at +15% (vs +5% for sub-min)
+   *   - fast_slow_down requires pnlPct ≥ +8% (vs +2% for sub-min)
+   *   - fast_sl unchanged (still useful safety net for violent reversals)
+   * When undefined or any other value, uses standard sub-min thresholds (no
+   * behavioral change on existing early_pump positions).
+   */
+  dispatchSource?: string;
 }
 
 export interface SlowDownExitVerdict {
@@ -976,44 +1039,53 @@ export interface SlowDownExitVerdict {
 
 /**
  * Évalue trois règles d'exit sub-1min sur une position détenue :
- *   1. fast_tp        — pnl ≥ +5% → take-profit immédiat (priorité 1)
+ *   1. fast_tp        — pnl ≥ +5% (sub-min) OR ≥ +15% (pump1h) → take-profit immédiat (priorité 1)
  *   2. fast_sl        — change30s ≤ -1% ET pnl ≥ -3% → safety stop avant fast_stop_loss (priorité 2)
- *   3. fast_slow_down — pnl ≥ +2% ET change30s > 0 ET v30s < 0.5×v2m ET v30s < v1m (priorité 3)
+ *   3. fast_slow_down — pnl ≥ +2% (sub-min) OR ≥ +8% (pump1h) ET change30s > 0 ET v30s < 0.5×v2m ET v30s < v1m (priorité 3)
  *
  * Returns null si aucune règle ne déclenche.
  *
  * Pure : aucun I/O. Le caller (worker WS) appelle cette fonction à chaque tick
  * d'un asset qu'on tient, avec le pnlPct calculé à partir du prix courant et de
  * l'avgBuyPrice (lus depuis trade_meta côté worker, ou depuis Redis).
+ *
+ * PUMP-1H DETECTOR (2026-05-03): when ctx.dispatchSource === "worker-pump1h",
+ * uses dedicated thresholds (FAST_TP_PUMP1H_PNL_PCT=15, SLOW_DOWN_PUMP1H_MIN_PNL_PCT=8).
+ * Otherwise unchanged (no regression on early_pump positions).
  */
 export function evaluateSlowDownExit(ctx: SlowDownExitContext): SlowDownExitVerdict | null {
-  const { pnlPct, change30s, change1min, change2min } = ctx;
+  const { pnlPct, change30s, change1min, change2min, dispatchSource } = ctx;
 
   // Need sub-minute data to reason about velocity
   if (change30s == null || change1min == null || change2min == null) {
     return null;
   }
 
-  // Rule 1: fast_tp — take-profit at +5% gross (≈ +4.5% net after fees)
-  if (pnlPct >= FAST_TP_PNL_PCT) {
+  // PUMP-1H DETECTOR (2026-05-03) — route thresholds by dispatch source
+  const isPump1h = dispatchSource === "worker-pump1h";
+  const fastTpThreshold = isPump1h ? FAST_TP_PUMP1H_PNL_PCT : FAST_TP_PNL_PCT;
+  const slowDownMinPnl = isPump1h ? SLOW_DOWN_PUMP1H_MIN_PNL_PCT : SLOW_DOWN_MIN_PNL_PCT;
+
+  // Rule 1: fast_tp — take-profit at +5% gross (sub-min) or +15% (pump1h)
+  if (pnlPct >= fastTpThreshold) {
     return {
       reasonCode: "fast_tp",
-      detail: `pnl=${pnlPct.toFixed(2)}% ≥ ${FAST_TP_PNL_PCT}%`,
+      detail: `pnl=${pnlPct.toFixed(2)}% ≥ ${fastTpThreshold}%${isPump1h ? " [pump1h]" : ""}`,
     };
   }
 
   // Rule 2: fast_sl — violent reversal sub-1min, sortie d'urgence avant que fast_stop_loss
   // (qui a besoin de change1h ≤ -8% AND pnl ≤ -10%) ne kicke. Sauve typiquement 5-7 points
-  // de perte sur les retournements brutaux.
+  // de perte sur les retournements brutaux. UNCHANGED for pump1h (still a useful safety net).
   if (change30s <= FAST_SL_CHANGE30S_PCT && pnlPct >= FAST_SL_MIN_PNL_PCT) {
     return {
       reasonCode: "fast_sl",
-      detail: `change30s=${change30s.toFixed(2)}% ≤ ${FAST_SL_CHANGE30S_PCT}%, pnl=${pnlPct.toFixed(2)}%`,
+      detail: `change30s=${change30s.toFixed(2)}% ≤ ${FAST_SL_CHANGE30S_PCT}%, pnl=${pnlPct.toFixed(2)}%${isPump1h ? " [pump1h]" : ""}`,
     };
   }
 
   // Rule 3: fast_slow_down — pump still positive but velocity collapsing
-  if (pnlPct < SLOW_DOWN_MIN_PNL_PCT) {
+  if (pnlPct < slowDownMinPnl) {
     return null;  // not enough cushion to lock in
   }
   if (change30s <= 0) {

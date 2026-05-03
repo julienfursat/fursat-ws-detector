@@ -44,10 +44,31 @@ import type { PositionsTracker } from "./positions.js";
 // Other signal types (major_crash, position_crash, major_pump, early_pump) are NOT affected.
 const WORKER_ALT_PUMP_BUY_ENABLED = (process.env.WORKER_ALT_PUMP_BUY_ENABLED ?? "false").toLowerCase() === "true";
 const WORKER_ALT_PUMP_DISABLED_COUNTER_KEY = "worker:alt_pump_disabled_count";
+
+// PUMP-1H DETECTOR (NEW 2026-05-03) — Sustained-pump path.
+// Activated additively to early_pump. Targets pumps that EARLY_ENTRY rejects
+// because change5m ≥ 4% (queue-of-pump in worker's view). See PUMP1H_*
+// constants in signal-rules.ts for full rationale and the TROLL +69% case
+// study that motivated this detector.
+//
+// Killswitch: WORKER_PUMP1H_BUY_ENABLED env var. Default false until validated
+// on 20+ samples. When false, the detector still EVALUATES (and logs the
+// near-miss) but does NOT dispatch.
+//
+// Cap horaire: 5/h max BUYs pump-1h (permissive for initial calibration).
+// Throttle per-asset: 60min (longer than early_pump's 30min because pump-1h
+// pumps last longer and we should not multi-buy the same asset within one
+// pump cycle).
+const WORKER_PUMP1H_BUY_ENABLED = (process.env.WORKER_PUMP1H_BUY_ENABLED ?? "false").toLowerCase() === "true";
+const WORKER_PUMP1H_HOURLY_COUNTER_KEY = "worker:hourly_pump1h_count";
+const WORKER_PUMP1H_DISPATCHED_KEY_PREFIX = "worker:dispatched:pump1h:";  // + symbol
+const WORKER_PUMP1H_HOURLY_CAP = 5;
+const WORKER_PUMP1H_THROTTLE_MS = 60 * 60 * 1000;  // 60min per-asset
 import {
   classifySignal,
   evaluateFastPathCandidate,
   evaluateEarlyEntry,
+  evaluatePump1hEntry,
   evaluateSlowDownExit,
   STABLES,
   MAJORS,
@@ -85,6 +106,9 @@ const FASTPATH_LOG_KEY = "dryrun:fastpath_log";  // Single canonical detection l
 // Despite "dryrun:" prefix (Redis guard), these logs trace REAL dispatches now, not just hypotheticals.
 const EARLY_DISPATCH_LOG_KEY = "dryrun:early_dispatch_log";
 const SLOW_DOWN_DISPATCH_LOG_KEY = "dryrun:slow_down_dispatch_log";
+// PUMP-1H DETECTOR (NEW 2026-05-03) — separate ring buffer for analysis.
+// Same LPUSH/LTRIM pattern as the others. Same MAX_LOG_ENTRIES cap.
+const PUMP1H_DISPATCH_LOG_KEY = "dryrun:pump1h_dispatch_log";
 // 50000 entries × ~1450 entries/h ≈ 34 hours of coverage at full production rate.
 // At ~10 KB compressed JSON per entry, this is ~5 MB Redis storage per log key.
 const MAX_LOG_ENTRIES = 50_000;
@@ -208,6 +232,33 @@ interface SlowDownDispatchEntry {
   dispatchSkipReason?: string;
 }
 
+// PUMP-1H DETECTOR (NEW 2026-05-03) — log entry for dryrun:pump1h_dispatch_log.
+// Mirrors EarlyDispatchEntry's shape so the same projectDryrunEntry projection
+// can render either type. Severity sentinel "pump1h" distinguishes from "early".
+interface Pump1hDispatchEntry {
+  ts: number;
+  parisTime: string;
+  decision: string;        // "dispatched" | "skipped:<reason>"
+  severity: "pump1h";      // sentinel — pump-1h dispatch events
+  symbol: string;
+  // Sub-minute windows (informative, not used by the detector itself but useful for analysis)
+  change30s: number | null;
+  change1min: number | null;
+  change2min: number | null;
+  // The windows actually used by evaluatePump1hEntry
+  change5m: number | null;
+  change15m: number | null;
+  change1h: number | null;
+  volume24h: number;
+  drawdownFromPeak: number;
+  isHeld: boolean;
+  // Verdict from evaluatePump1hEntry
+  isPump1h: boolean;
+  reason: string;
+  dispatched: boolean;
+  dispatchSkipReason?: string;
+}
+
 export class Detector {
   private ringBuffers: RingBuffers;
   private tradableSymbols: Set<string>;
@@ -231,6 +282,8 @@ export class Detector {
   // BACKLOG-3 phase 2 (2026-05-01) — ACTIVE early-pump and slow-down logs
   private pendingEarlyDispatch: EarlyDispatchEntry[] = [];
   private pendingSlowDown: SlowDownDispatchEntry[] = [];
+  // PUMP-1H DETECTOR (NEW 2026-05-03) — pending log buffer
+  private pendingPump1h: Pump1hDispatchEntry[] = [];
 
   // Counters surfaced via stats()
   private ticksEvaluated = 0;
@@ -248,6 +301,14 @@ export class Detector {
   private slowDownEvaluated = 0;
   private slowDownTriggered = 0;
   private slowDownDispatched = 0;
+
+  // PUMP-1H DETECTOR (NEW 2026-05-03) — separate counters from early/slow-down
+  // so we can analyze pump-1h dispatches in isolation.
+  private pump1hEvaluated = 0;
+  private pump1hTriggered = 0;
+  private pump1hDispatched = 0;
+  private pump1hSkippedKillswitch = 0;
+  private pump1hSkippedHourlyCap = 0;
 
   // Étape 2B dispatch counters
   private dispatchAttempted = 0;
@@ -484,6 +545,64 @@ export class Detector {
       }
     }
 
+    // ─── PUMP-1H DETECTOR (NEW 2026-05-03) — Sustained-pump entry ───
+    // Evaluated INDEPENDENTLY of early_pump and classifySignal. Targets pumps
+    // that EARLY_ENTRY rejects because change5m ≥ 4% (queue-of-pump in worker
+    // view). NOT mutually exclusive with early_pump in code: if both trigger
+    // on the same tick (rare — different change5m regimes), early_pump takes
+    // precedence because it was evaluated first and its dispatch is in flight.
+    // The inFlightDispatches Set guarantees no double-BUY.
+    //
+    // Pre-conditions match early_pump: not already classified as alt_pump/crash,
+    // not held.
+    if (!alreadyClassified && !isHeld) {
+      this.pump1hEvaluated++;
+      const pump1hVerdict = evaluatePump1hEntry(input);
+      if (pump1hVerdict.isPump1h) {
+        this.pump1hTriggered++;
+        // Synthesize a MomentumCandidate of type "pump1h" with severity "strong".
+        // The triggerSource is "1h" since this detector keys off the 1h window.
+        const pump1hCandidate: MomentumCandidate = {
+          symbol,
+          currentPrice: snap.currentPrice,
+          change30s: snap.change30s,
+          change1min: snap.change1min,
+          change2min: snap.change2min,
+          change5m: snap.change5m,
+          change15m: snap.change15m,
+          change1h: snap.change1h,
+          change4h: snap.change4h,
+          change24h,
+          volume24h: snap.volume24h,
+          score: 0,                       // not used downstream for pump1h
+          signalType: "pump1h" as MomentumCandidate["signalType"],  // NEW signalType — entry.ts handles it as opportunity-pump1h
+          severity: "strong",
+          isHeld,
+          drawdownFromPeak: snap.drawdownFromPeak,
+          peakSampleCount: snap.peakSampleCount,
+          triggerSource: "1h",
+        };
+        logger.info("⚡ PUMP-1H DISPATCH (candidate)", {
+          symbol, ...{
+            change5m: snap.change5m?.toFixed(2),
+            change15m: snap.change15m?.toFixed(2),
+            change1h: snap.change1h?.toFixed(2),
+            volume24h: Math.round(snap.volume24h / 1000) + "k",
+            reason: pump1hVerdict.reason,
+            killswitch_enabled: WORKER_PUMP1H_BUY_ENABLED,
+          },
+        });
+        void this.tryDispatchPump1h(pump1hCandidate, pump1hVerdict.reason);
+      } else {
+        // Optional: log near-miss pump-1h evaluations for calibration. Only log
+        // when change1h is meaningful (≥5%) to avoid flooding the log with
+        // routine ticks that are nowhere near triggering.
+        if (snap.change1h !== null && snap.change1h >= 5) {
+          this.recordPump1hDispatch(now, input, false, pump1hVerdict.reason, false, "not_triggered");
+        }
+      }
+    }
+
     // ─── BACKLOG-3 phase 2 (2026-05-01) — SLOW-DOWN EXIT (sub-minute) ───
     // Evaluated on every tick of a HELD asset. Dispatches POST to /api/agent/fast-exit
     // with reasonCode = fast_slow_down / fast_tp / fast_sl when the rule fires.
@@ -545,10 +664,18 @@ export class Detector {
       triggered: number;
       dispatched: number;
     };
+    pump1h: {
+      evaluated: number;
+      triggered: number;
+      dispatched: number;
+      skippedKillswitch: number;
+      skippedHourlyCap: number;
+    };
     pendingFiltered: number;
     pendingFastPath: number;
     pendingEarlyDispatch: number;
     pendingSlowDown: number;
+    pendingPump1h: number;
   } {
     return {
       tradableUniverse: this.tradableSymbols.size,
@@ -578,10 +705,18 @@ export class Detector {
         triggered: this.slowDownTriggered,
         dispatched: this.slowDownDispatched,
       },
+      pump1h: {
+        evaluated: this.pump1hEvaluated,
+        triggered: this.pump1hTriggered,
+        dispatched: this.pump1hDispatched,
+        skippedKillswitch: this.pump1hSkippedKillswitch,
+        skippedHourlyCap: this.pump1hSkippedHourlyCap,
+      },
       pendingFiltered: this.pendingFiltered.length,
       pendingFastPath: this.pendingFastPath.length,
       pendingEarlyDispatch: this.pendingEarlyDispatch.length,
       pendingSlowDown: this.pendingSlowDown.length,
+      pendingPump1h: this.pendingPump1h.length,
     };
   }
 
@@ -750,6 +885,132 @@ export class Detector {
   }
 
   /**
+   * PUMP-1H DETECTOR (NEW 2026-05-03) — dispatch a pump-1h BUY.
+   *
+   * Pre-checks (ordered):
+   *   1. Killswitch — if WORKER_PUMP1H_BUY_ENABLED=false, log near-miss and return.
+   *      Safety: this is the master switch to disable pump-1h dispatches in
+   *      production while the detector is still being calibrated.
+   *   2. In-flight — same in-flight Set as early_pump (single source of truth
+   *      across all detector dispatches; prevents double-BUY of any kind).
+   *   3. Hourly cap — atomic counter at WORKER_PUMP1H_HOURLY_COUNTER_KEY with
+   *      hour-bucket key and 1h TTL. Permissive cap of 5/h (test calibration).
+   *   4. Per-asset throttle — 60min cooldown via WORKER_PUMP1H_DISPATCHED_KEY_PREFIX
+   *      (keyed per symbol). Longer than early_pump's 30min because pump-1h
+   *      pumps last longer and we should not multi-buy the same asset.
+   *   5. Blacklist — same shared blacklist as early_pump (account_not_available, etc.).
+   *
+   * If all pre-checks pass, dispatches via dispatchEntry with signalType="pump1h".
+   * The Vercel entry.ts side recognizes this signalType and stores the trade
+   * with type="opportunity-pump1h" so fast-exit-evaluator routes the position
+   * to the dedicated pump-1h exit thresholds (fast_tp +15%, ratchet 5pt fixed).
+   */
+  private async tryDispatchPump1h(c: MomentumCandidate, pump1hReason: string): Promise<void> {
+    const symbol = c.symbol;
+    const now = Date.now();
+
+    // 1. Killswitch — log near-miss but DO NOT dispatch
+    if (!WORKER_PUMP1H_BUY_ENABLED) {
+      this.pump1hSkippedKillswitch++;
+      this.recordPump1hDispatch(now, this.candidateToInput(c), true, pump1hReason, false, "killswitch_disabled");
+      logger.info("Pump-1h dispatch SKIPPED — killswitch disabled", {
+        symbol, reason: pump1hReason,
+      });
+      return;
+    }
+
+    // 2. In-flight (shared Set across early/pump1h to prevent double-BUY)
+    if (this.inFlightDispatches.has(symbol)) {
+      this.recordPump1hDispatch(now, this.candidateToInput(c), true, pump1hReason, false, "in_flight");
+      return;
+    }
+    this.inFlightDispatches.add(symbol);
+
+    try {
+      // 3. Hourly cap (atomic check via Redis bucketed counter)
+      const hourBucket = Math.floor(now / (60 * 60 * 1000));
+      const counterKey = `${WORKER_PUMP1H_HOURLY_COUNTER_KEY}:${hourBucket}`;
+      const currentCount = (await redisGet<number>(counterKey)) ?? 0;
+      if (currentCount >= WORKER_PUMP1H_HOURLY_CAP) {
+        this.pump1hSkippedHourlyCap++;
+        this.recordPump1hDispatch(now, this.candidateToInput(c), true, pump1hReason, false, `hourly_cap:${currentCount}/${WORKER_PUMP1H_HOURLY_CAP}`);
+        logger.info("Pump-1h dispatch SKIPPED — hourly cap reached", {
+          symbol, currentCount, cap: WORKER_PUMP1H_HOURLY_CAP,
+        });
+        return;
+      }
+
+      // 4. Per-asset throttle (60min cooldown)
+      const throttleKey = `${WORKER_PUMP1H_DISPATCHED_KEY_PREFIX}${symbol}`;
+      const lastDispatchedAt = await redisGet<number>(throttleKey);
+      if (lastDispatchedAt && (now - lastDispatchedAt) < WORKER_PUMP1H_THROTTLE_MS) {
+        const remainingMin = Math.ceil((WORKER_PUMP1H_THROTTLE_MS - (now - lastDispatchedAt)) / 60000);
+        this.recordPump1hDispatch(now, this.candidateToInput(c), true, pump1hReason, false, `throttle:per_asset:${remainingMin}min`);
+        logger.info("Pump-1h dispatch SKIPPED — per-asset throttle", {
+          symbol, remainingMin,
+        });
+        return;
+      }
+
+      // 5. Blacklist (shared with early_pump and classical paths)
+      const blacklistCheck = await isBlacklisted(symbol);
+      if (blacklistCheck.blacklisted) {
+        this.dispatchPreCheckFailed.blacklist++;
+        this.recordPump1hDispatch(now, this.candidateToInput(c), true, pump1hReason, false, `blacklist:${blacklistCheck.reason}`);
+        logger.info("Pump-1h dispatch SKIPPED — blacklisted", {
+          symbol, reason: blacklistCheck.reason,
+        });
+        return;
+      }
+
+      // All pre-checks passed — dispatch
+      this.dispatchAttempted++;
+      this.pump1hDispatched++;
+      const signal = {
+        symbol,
+        change5m: c.change5m,
+        change15m: c.change15m,
+        change1h: c.change1h,
+        change24h: c.change24h,
+        volume24h: c.volume24h,
+        drawdownFromPeak: c.drawdownFromPeak,
+        severity: c.severity,
+        signalType: c.signalType as DispatchSignal["signalType"],  // safe cast: entry.ts accepts string
+        triggerSource: c.triggerSource as DispatchSignal["triggerSource"],
+        signalPrice: c.currentPrice,
+        signalTimestamp: now,
+        // Sub-minute deltas (informative for entry.ts logging, not required for pump1h decision)
+        change30s: c.change30s,
+        change1min: c.change1min,
+        change2min: c.change2min,
+      } as DispatchSignal;
+      const result = await dispatchEntry(signal);
+
+      if (result.ok) {
+        this.dispatchOk++;
+        // Update Redis counters AFTER successful dispatch (avoid burning the
+        // hourly slot on failed dispatches like blacklist hits or 5xx errors).
+        try {
+          await redisSet(counterKey, currentCount + 1, { ex: 60 * 60 });  // 1h TTL
+          await redisSet(throttleKey, now, { ex: 2 * 60 * 60 });  // 2h TTL (covers throttle window with margin)
+        } catch (err) {
+          logger.warn("Pump-1h counter update failed (non-fatal)", { symbol, err: (err as Error).message });
+        }
+      }
+      else if (result.skipped) this.dispatchSkipped++;
+      else if (result.error) this.dispatchNetworkError++;
+      else this.dispatchHttpError++;
+
+      this.recordPump1hDispatch(now, this.candidateToInput(c), true, pump1hReason, true);
+    } catch (err) {
+      logger.error("tryDispatchPump1h threw", { symbol, err: (err as Error).message });
+      this.recordPump1hDispatch(now, this.candidateToInput(c), true, pump1hReason, false, `exception:${(err as Error).message}`);
+    } finally {
+      this.inFlightDispatches.delete(symbol);
+    }
+  }
+
+  /**
    * Helper: rebuild a ClassifyInput from a MomentumCandidate for logging.
    * Only used by recordEarlyDispatch — extracts the fields we want to persist.
    */
@@ -847,11 +1108,13 @@ export class Detector {
     // synchronized with the rest of the worker.
     let pnlPct: number;
     let avgBuyPrice: number;
+    let dispatchSource: string | undefined;  // PUMP-1H DETECTOR (2026-05-03)
     if (this.positions) {
       const pos = this.positions.updatePriceForSymbol(symbol, snap.currentPrice);
       if (!pos) return;  // not held according to positions tracker
       pnlPct = pos.pnlPct;
       avgBuyPrice = pos.avgBuyPrice;
+      dispatchSource = pos.dispatchSource;  // PUMP-1H DETECTOR (2026-05-03) — route exit thresholds
     } else {
       // Legacy fallback path (kept for backwards compat — should not be used
       // in production once worker-index passes positions to the constructor).
@@ -859,6 +1122,7 @@ export class Detector {
       if (legacyAvg == null || legacyAvg <= 0) return;
       avgBuyPrice = legacyAvg;
       pnlPct = ((snap.currentPrice - avgBuyPrice) / avgBuyPrice) * 100;
+      // dispatchSource undefined → uses standard sub-min thresholds
     }
 
     const verdict = evaluateSlowDownExit({
@@ -866,6 +1130,7 @@ export class Detector {
       change30s: snap.change30s,
       change1min: snap.change1min,
       change2min: snap.change2min,
+      dispatchSource,  // PUMP-1H DETECTOR (2026-05-03) — router for exit thresholds
     });
 
     if (!verdict) return;
@@ -986,6 +1251,41 @@ export class Detector {
   // into recordFastPath). The two methods produced strictly identical event
   // sets. fastpath_log is now the canonical detection event log.
 
+  /**
+   * PUMP-1H DETECTOR (NEW 2026-05-03) — log buffer entry for pump1h_dispatch_log.
+   * Mirrors recordEarlyDispatch shape (just with isPump1h instead of isEarly,
+   * and severity sentinel "pump1h").
+   */
+  private recordPump1hDispatch(
+    ts: number,
+    input: ClassifyInput,
+    isPump1h: boolean,
+    reason: string,
+    dispatched: boolean,
+    dispatchSkipReason?: string,
+  ): void {
+    this.pendingPump1h.push({
+      ts,
+      parisTime: formatParisTime(ts),
+      decision: dispatched ? "dispatched" : `skipped:${dispatchSkipReason ?? "no_reason"}`,
+      severity: "pump1h",
+      symbol: input.symbol,
+      change30s: input.change30s ?? null,
+      change1min: input.change1min ?? null,
+      change2min: input.change2min ?? null,
+      change5m: input.change5m,
+      change15m: input.change15m,
+      change1h: input.change1h,
+      volume24h: input.volume24h,
+      drawdownFromPeak: input.drawdownFromPeak,
+      isHeld: input.isHeld,
+      isPump1h,
+      reason,
+      dispatched,
+      dispatchSkipReason,
+    });
+  }
+
   private recordFiltered(
     ts: number, symbol: string, reason: SkipReason,
     snap: { change5m: number | null; change15m: number | null; change1h: number | null }
@@ -1069,7 +1369,8 @@ export class Detector {
       this.pendingFiltered.length === 0 &&
       this.pendingFastPath.length === 0 &&
       this.pendingEarlyDispatch.length === 0 &&
-      this.pendingSlowDown.length === 0
+      this.pendingSlowDown.length === 0 &&
+      this.pendingPump1h.length === 0
     ) {
       return;
     }
@@ -1078,6 +1379,7 @@ export class Detector {
     const fastPathToFlush = this.pendingFastPath.splice(0);
     const earlyToFlush = this.pendingEarlyDispatch.splice(0);
     const slowDownToFlush = this.pendingSlowDown.splice(0);
+    const pump1hToFlush = this.pendingPump1h.splice(0);
 
     if (filteredToFlush.length > 0) {
       const ok = await redisLpush(FILTERED_LOG_KEY, filteredToFlush);
@@ -1112,6 +1414,16 @@ export class Detector {
         await redisLtrim(SLOW_DOWN_DISPATCH_LOG_KEY, 0, MAX_LOG_ENTRIES - 1);
       } else {
         this.pendingSlowDown.unshift(...slowDownToFlush);
+      }
+    }
+
+    // PUMP-1H DETECTOR (NEW 2026-05-03)
+    if (pump1hToFlush.length > 0) {
+      const ok = await redisLpush(PUMP1H_DISPATCH_LOG_KEY, pump1hToFlush);
+      if (ok) {
+        await redisLtrim(PUMP1H_DISPATCH_LOG_KEY, 0, MAX_LOG_ENTRIES - 1);
+      } else {
+        this.pendingPump1h.unshift(...pump1hToFlush);
       }
     }
   }

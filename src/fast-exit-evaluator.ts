@@ -110,6 +110,12 @@ export class FastExitEvaluator {
       pnlPct: pos.pnlPct,
       valueUSD: pos.valueUSD,
       source: "trade_meta",  // worker only surveils positions present in trade_meta
+      // PUMP-1H DETECTOR (NEW 2026-05-03) — Pass dispatchSource through to rules.
+      // When "worker-pump1h", evaluateFastExitRules uses dedicated thresholds
+      // (FAST_RATCHET_PUMP1H_DRAWDOWN_PTS=5 fixed). When undefined or any other
+      // value, uses standard asymmetric ratchet (no behavioral change on
+      // existing early_pump positions).
+      dispatchSource: pos.dispatchSource,
     };
     const ctx: FastExitContext = {
       pnlMax: tracked.pnlMax,
