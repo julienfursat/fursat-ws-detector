@@ -26,7 +26,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { logger } from "./logger.js";
-import { redisGet, redisSet } from "./redis.js";
+import { redisGet, redisSet, redisLpush, redisLtrim } from "./redis.js";
 import { RingBuffers } from "./ring-buffers.js";
 import { checkThrottle } from "./throttle.js";
 import { isBlacklisted } from "./blacklist.js";
@@ -66,38 +66,57 @@ import {
 
 // Logs kept in Redis — bounded to prevent unbounded growth.
 // Use dryrun:* prefix so the assertDryrunKey guard in redis.ts allows the writes.
-const DETECTED_LOG_KEY = "dryrun:detected_signals_log";
+//
+// BACKLOG-3 phase 4 (2026-05-03) — Migrated from JSON-blob (GET → merge → SET) to
+// Redis LIST (LPUSH + LTRIM). Two reasons:
+//   1. The blob pattern was O(N) per flush (re-serialize the whole array). At 50000
+//      entries that's ~5 MB written every 5s = unworkable.
+//   2. The previous cap of 1000 entries saturated in ~42 min at production rates
+//      (~1450 entries/h), making 24h analysis impossible.
+// LIST + LPUSH is O(1) per write, so the cap can grow safely.
+//
+// dryrun:detected_signals_log was DEPRECATED in this phase: it carried strictly
+// the same events as fastpath_log (recordDetected and recordFastPath were called
+// back-to-back on every detection — see lines ~335/339), wasting ~50% of dryrun
+// log writes for zero analytical value. fastpath_log is now the single source.
 const FILTERED_LOG_KEY = "dryrun:filtered_signals_log";
-const FASTPATH_LOG_KEY = "dryrun:fastpath_log";  // BACKLOG-3 phase 1, log-only fast-path observation
+const FASTPATH_LOG_KEY = "dryrun:fastpath_log";  // Single canonical detection log
 // BACKLOG-3 phase 2 (2026-05-01) — ACTIVE early-pump dispatch + slow-down exit observations.
 // Despite "dryrun:" prefix (Redis guard), these logs trace REAL dispatches now, not just hypotheticals.
 const EARLY_DISPATCH_LOG_KEY = "dryrun:early_dispatch_log";
 const SLOW_DOWN_DISPATCH_LOG_KEY = "dryrun:slow_down_dispatch_log";
-const MAX_LOG_ENTRIES = 1000;
+// 50000 entries × ~1450 entries/h ≈ 34 hours of coverage at full production rate.
+// At ~10 KB compressed JSON per entry, this is ~5 MB Redis storage per log key.
+const MAX_LOG_ENTRIES = 50_000;
+
+/**
+ * Format a Unix timestamp (ms) as Paris-local "YYYY-MM-DD HH:mm:ss".
+ * Used for human-readable parisTime field on every dryrun entry, so downstream
+ * analysis (debug-export → projectDryrunEntry) can render it directly without
+ * needing tz lookups in the browser.
+ */
+function formatParisTime(tsMs: number): string {
+  const d = new Date(tsMs);
+  // toLocaleString with explicit Paris tz, then re-shape to "YYYY-MM-DD HH:mm:ss".
+  // Avoid toISOString (UTC) and avoid hand-rolled offset arithmetic (DST headaches).
+  const parts = new Intl.DateTimeFormat("fr-FR", {
+    timeZone: "Europe/Paris",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const get = (t: string) => parts.find(p => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")}`;
+}
 
 // In-memory log buffers (flushed to Redis on a timer for efficiency).
 // Without batching, a fast pump triggering 50 detections in 5 seconds would
 // generate 50 Redis writes, hurting throughput.
 const FLUSH_INTERVAL_MS = 5_000;
 
-interface DetectedEntry {
-  ts: number;
-  symbol: string;
-  signalType: string;
-  severity: string;
-  triggerSource: string | null;
-  // Sub-minute observability windows (NEW 2026-04-30 — log-only, BACKLOG-3 phase A)
-  change30s: number | null;
-  change1min: number | null;
-  change2min: number | null;
-  change5m: number | null;
-  change15m: number | null;
-  change1h: number | null;
-  change4h: number | null;
-  volume24h: number;
-  drawdownFromPeak: number;
-  isHeld: boolean;
-}
+// BACKLOG-3 phase 4 (2026-05-03) — DetectedEntry interface removed: the type
+// was used solely for the deprecated dryrun:detected_signals_log, which carried
+// a strict duplicate of fastpath_log. fastpath_log is the canonical event log.
 
 interface FilteredEntry {
   ts: number;
@@ -108,12 +127,19 @@ interface FilteredEntry {
   change1h: number | null;
 }
 
-// BACKLOG-3 phase 1 (2026-04-30) — log-only fast-path candidate observation.
-// One entry per detected signal (alongside DetectedEntry), recording what the
-// hypothetical fast-path system WOULD have done. Used for empirical calibration
-// of Y_STRONG, Y_MAJOR, X_MIN before activating real fast-path triggers.
+// BACKLOG-3 phase 1 (2026-04-30) — fast-path candidate observation log.
+// One entry per detected signal, recording what the fast-path system WOULD have done.
+// Used for empirical calibration of Y_STRONG, Y_MAJOR, X_MIN before activating
+// real fast-path triggers. Now the canonical detection event log (BACKLOG-3 phase 4).
 interface FastPathEntry {
   ts: number;
+  // BACKLOG-3 phase 4 (2026-05-03) — annotations for downstream projectDryrunEntry.
+  // Without these, debug-export returns null for parisTime/severity/decision/reason
+  // making 1000+ entries practically unanalyzable.
+  parisTime: string;       // human-readable Europe/Paris timestamp
+  severity: "weak" | "strong" | "major";  // mirrors classicalSeverity but at the top level
+  decision: string;         // "fastpath_qualified" | "fastpath_observed" — what the fast-path verdict was
+  reason: string;           // short human reason (e.g. "wouldFireStrong", "wouldFilterDead: change5m<2")
   symbol: string;
   // Sub-minute windows (the variables we want to calibrate)
   change30s: number | null;
@@ -143,6 +169,10 @@ interface FastPathEntry {
 // Used to monitor real production behavior and tune EARLY_ENTRY_* thresholds.
 interface EarlyDispatchEntry {
   ts: number;
+  // BACKLOG-3 phase 4 (2026-05-03) — annotations for projectDryrunEntry compatibility.
+  parisTime: string;
+  decision: string;        // "dispatched" | "skipped:<reason>" — single-field summary
+  severity: "early";       // sentinel — early_pump dispatches don't have classical severity
   symbol: string;
   change30s: number | null;
   change1min: number | null;
@@ -164,6 +194,9 @@ interface EarlyDispatchEntry {
 // One entry per evaluation on a HELD asset that triggered a slow-down/tp/sl verdict.
 interface SlowDownDispatchEntry {
   ts: number;
+  parisTime: string;       // BACKLOG-3 phase 4 (2026-05-03) — for projectDryrunEntry
+  decision: string;        // "dispatched" | "skipped:<reason>"
+  severity: "exit";        // sentinel — exit events, not entry signals
   symbol: string;
   pnlPct: number;
   change30s: number | null;
@@ -190,7 +223,9 @@ export class Detector {
   private flushTimer: NodeJS.Timeout | null = null;
 
   // Pending log entries (flushed every FLUSH_INTERVAL_MS)
-  private pendingDetected: DetectedEntry[] = [];
+  // BACKLOG-3 phase 4 (2026-05-03) — pendingDetected removed: was a strict
+  // duplicate of pendingFastPath (recordDetected and recordFastPath were called
+  // back-to-back on every detection). fastpath_log is now the canonical event log.
   private pendingFiltered: FilteredEntry[] = [];
   private pendingFastPath: FastPathEntry[] = [];  // BACKLOG-3 phase 1
   // BACKLOG-3 phase 2 (2026-05-01) — ACTIVE early-pump and slow-down logs
@@ -332,10 +367,11 @@ export class Detector {
       this.byTriggerSource[ts]++;
       const sev = result.candidate.severity as keyof typeof this.bySeverity;
       this.bySeverity[sev]++;
-      this.recordDetected(now, result.candidate);
 
-      // BACKLOG-3 phase 1: log-only fast-path evaluation. Pure function, no I/O,
-      // result buffered for periodic flush along with detected/filtered logs.
+      // BACKLOG-3 phase 4 (2026-05-03) — recordDetected was deduplicated.
+      // The two record* calls produced strictly identical event sets in two
+      // different log keys, doubling Redis writes for zero analytical value.
+      // fastpath_log is now the canonical detection event log.
       this.recordFastPath(now, result.candidate);
 
       logger.info("⚡ SIGNAL DETECTED", {
@@ -509,7 +545,6 @@ export class Detector {
       triggered: number;
       dispatched: number;
     };
-    pendingDetected: number;
     pendingFiltered: number;
     pendingFastPath: number;
     pendingEarlyDispatch: number;
@@ -543,7 +578,6 @@ export class Detector {
         triggered: this.slowDownTriggered,
         dispatched: this.slowDownDispatched,
       },
-      pendingDetected: this.pendingDetected.length,
       pendingFiltered: this.pendingFiltered.length,
       pendingFastPath: this.pendingFastPath.length,
       pendingEarlyDispatch: this.pendingEarlyDispatch.length,
@@ -897,6 +931,9 @@ export class Detector {
   ): void {
     this.pendingEarlyDispatch.push({
       ts,
+      parisTime: formatParisTime(ts),
+      decision: dispatched ? "dispatched" : `skipped:${dispatchSkipReason ?? "no_reason"}`,
+      severity: "early",
       symbol: input.symbol,
       change30s: input.change30s ?? null,
       change1min: input.change1min ?? null,
@@ -930,6 +967,9 @@ export class Detector {
   ): void {
     this.pendingSlowDown.push({
       ts,
+      parisTime: formatParisTime(ts),
+      decision: dispatched ? `dispatched:${reasonCode}` : `skipped:${dispatchSkipReason ?? "no_reason"}`,
+      severity: "exit",
       symbol,
       pnlPct,
       change30s: snap.change30s,
@@ -942,26 +982,9 @@ export class Detector {
     });
   }
 
-  private recordDetected(ts: number, c: MomentumCandidate): void {
-    this.pendingDetected.push({
-      ts,
-      symbol: c.symbol,
-      signalType: c.signalType,
-      severity: c.severity,
-      triggerSource: c.triggerSource,
-      // Sub-minute observability windows — for BACKLOG-3 calibration
-      change30s: c.change30s,
-      change1min: c.change1min,
-      change2min: c.change2min,
-      change5m: c.change5m,
-      change15m: c.change15m,
-      change1h: c.change1h,
-      change4h: c.change4h,
-      volume24h: c.volume24h,
-      drawdownFromPeak: c.drawdownFromPeak,
-      isHeld: c.isHeld,
-    });
-  }
+  // BACKLOG-3 phase 4 (2026-05-03) — recordDetected was removed (deduplicated
+  // into recordFastPath). The two methods produced strictly identical event
+  // sets. fastpath_log is now the canonical detection event log.
 
   private recordFiltered(
     ts: number, symbol: string, reason: SkipReason,
@@ -978,14 +1001,35 @@ export class Detector {
   }
 
   /**
-   * BACKLOG-3 phase 1 — log-only fast-path observation.
-   * Calls the pure evaluator from signal-rules.ts and buffers the result
-   * for periodic flush. Triggers ZERO real action.
+   * BACKLOG-3 phase 1 — fast-path evaluation log (now canonical detection event log).
+   * Calls the pure evaluator from signal-rules.ts and buffers the result for periodic flush.
+   *
+   * BACKLOG-3 phase 4 (2026-05-03) — Enriched with parisTime/severity/decision/reason
+   * annotations so debug-export's projectDryrunEntry produces non-null values for
+   * downstream analysis. Without these, the 1000+ entries returned were essentially
+   * empty shells (numeric metrics only, no labels).
    */
   private recordFastPath(ts: number, c: MomentumCandidate): void {
     const verdict = evaluateFastPathCandidate(c);
+    // Decision is what the fast-path verdict said: "qualified" if it would have fired
+    // in production, "observed" otherwise (still useful for retrospective calibration).
+    const decision = verdict.wouldFireMajor
+      ? "fastpath_qualified_major"
+      : verdict.wouldFireStrong
+        ? "fastpath_qualified_strong"
+        : verdict.wouldFilterDead
+          ? "fastpath_filtered_dead"
+          : "fastpath_observed";
+    // Reason: short human-readable summary. Capped to 120 chars (matching projectDryrunEntry).
+    const reason = verdict.reasons.length > 0
+      ? verdict.reasons.join("; ").slice(0, 120)
+      : `${c.signalType}/${c.severity}${c.triggerSource ? `@${c.triggerSource}` : ""}`;
     this.pendingFastPath.push({
       ts,
+      parisTime: formatParisTime(ts),
+      severity: c.severity,        // top-level mirror of classicalSeverity for projectDryrunEntry
+      decision,
+      reason,
       symbol: c.symbol,
       change30s: c.change30s,
       change1min: c.change1min,
@@ -1008,17 +1052,20 @@ export class Detector {
   }
 
   /**
-   * Flush pending log entries to Redis, prepending to the existing list and
-   * truncating at MAX_LOG_ENTRIES. Done periodically rather than per-event
-   * to amortize Redis cost on bursty pump waves.
+   * Flush pending log entries to Redis.
+   *
+   * BACKLOG-3 phase 4 (2026-05-03) — Migrated from JSON-blob (GET → merge → SET)
+   * to Redis LIST (LPUSH + LTRIM). The blob pattern was O(N) per flush which became
+   * unworkable at MAX_LOG_ENTRIES = 50000 (5 MB re-serialized every 5s). With LIST,
+   * each flush is 2 round-trips per log key regardless of total list size.
+   *
+   * Failure semantics: on LPUSH failure we re-queue locally, exactly like before.
+   * LTRIM failure is non-fatal (next flush will trim correctly).
    */
   private async flushLogs(): Promise<void> {
     // BACKLOG-13 phase 1.B (2026-04-30): short-circuit when nothing to flush.
-    // Saves Redis commands every 5s during quiet periods (nights, weekends,
-    // calm market) — typically -50% writes when no signal activity.
-    // BACKLOG-3 phase 2 (2026-05-01): added early/slow-down buffers to the check.
+    // Saves Redis commands every 5s during quiet periods.
     if (
-      this.pendingDetected.length === 0 &&
       this.pendingFiltered.length === 0 &&
       this.pendingFastPath.length === 0 &&
       this.pendingEarlyDispatch.length === 0 &&
@@ -1027,67 +1074,43 @@ export class Detector {
       return;
     }
 
-    const detectedToFlush = this.pendingDetected.splice(0);
     const filteredToFlush = this.pendingFiltered.splice(0);
     const fastPathToFlush = this.pendingFastPath.splice(0);
     const earlyToFlush = this.pendingEarlyDispatch.splice(0);
     const slowDownToFlush = this.pendingSlowDown.splice(0);
 
-    if (detectedToFlush.length > 0) {
-      try {
-        const existing: DetectedEntry[] = (await redisGet<DetectedEntry[]>(DETECTED_LOG_KEY)) ?? [];
-        const merged = [...detectedToFlush, ...existing].slice(0, MAX_LOG_ENTRIES);
-        await redisSet(DETECTED_LOG_KEY, merged);
-      } catch (err) {
-        logger.warn("Failed to flush detected log", { err: (err as Error).message });
-        // Re-queue so we don't lose them on transient failure
-        this.pendingDetected.unshift(...detectedToFlush);
-      }
-    }
-
     if (filteredToFlush.length > 0) {
-      try {
-        const existing: FilteredEntry[] = (await redisGet<FilteredEntry[]>(FILTERED_LOG_KEY)) ?? [];
-        const merged = [...filteredToFlush, ...existing].slice(0, MAX_LOG_ENTRIES);
-        await redisSet(FILTERED_LOG_KEY, merged);
-      } catch (err) {
-        logger.warn("Failed to flush filtered log", { err: (err as Error).message });
+      const ok = await redisLpush(FILTERED_LOG_KEY, filteredToFlush);
+      if (ok) {
+        await redisLtrim(FILTERED_LOG_KEY, 0, MAX_LOG_ENTRIES - 1);
+      } else {
         this.pendingFiltered.unshift(...filteredToFlush);
       }
     }
 
-    // BACKLOG-3 phase 1 — flush fast-path observation log
     if (fastPathToFlush.length > 0) {
-      try {
-        const existing: FastPathEntry[] = (await redisGet<FastPathEntry[]>(FASTPATH_LOG_KEY)) ?? [];
-        const merged = [...fastPathToFlush, ...existing].slice(0, MAX_LOG_ENTRIES);
-        await redisSet(FASTPATH_LOG_KEY, merged);
-      } catch (err) {
-        logger.warn("Failed to flush fastpath log", { err: (err as Error).message });
+      const ok = await redisLpush(FASTPATH_LOG_KEY, fastPathToFlush);
+      if (ok) {
+        await redisLtrim(FASTPATH_LOG_KEY, 0, MAX_LOG_ENTRIES - 1);
+      } else {
         this.pendingFastPath.unshift(...fastPathToFlush);
       }
     }
 
-    // BACKLOG-3 phase 2 — flush early-dispatch log
     if (earlyToFlush.length > 0) {
-      try {
-        const existing: EarlyDispatchEntry[] = (await redisGet<EarlyDispatchEntry[]>(EARLY_DISPATCH_LOG_KEY)) ?? [];
-        const merged = [...earlyToFlush, ...existing].slice(0, MAX_LOG_ENTRIES);
-        await redisSet(EARLY_DISPATCH_LOG_KEY, merged);
-      } catch (err) {
-        logger.warn("Failed to flush early dispatch log", { err: (err as Error).message });
+      const ok = await redisLpush(EARLY_DISPATCH_LOG_KEY, earlyToFlush);
+      if (ok) {
+        await redisLtrim(EARLY_DISPATCH_LOG_KEY, 0, MAX_LOG_ENTRIES - 1);
+      } else {
         this.pendingEarlyDispatch.unshift(...earlyToFlush);
       }
     }
 
-    // BACKLOG-3 phase 2 — flush slow-down dispatch log
     if (slowDownToFlush.length > 0) {
-      try {
-        const existing: SlowDownDispatchEntry[] = (await redisGet<SlowDownDispatchEntry[]>(SLOW_DOWN_DISPATCH_LOG_KEY)) ?? [];
-        const merged = [...slowDownToFlush, ...existing].slice(0, MAX_LOG_ENTRIES);
-        await redisSet(SLOW_DOWN_DISPATCH_LOG_KEY, merged);
-      } catch (err) {
-        logger.warn("Failed to flush slow-down log", { err: (err as Error).message });
+      const ok = await redisLpush(SLOW_DOWN_DISPATCH_LOG_KEY, slowDownToFlush);
+      if (ok) {
+        await redisLtrim(SLOW_DOWN_DISPATCH_LOG_KEY, 0, MAX_LOG_ENTRIES - 1);
+      } else {
         this.pendingSlowDown.unshift(...slowDownToFlush);
       }
     }
