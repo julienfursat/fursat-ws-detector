@@ -990,9 +990,17 @@ export class Detector {
         this.dispatchOk++;
         // Update Redis counters AFTER successful dispatch (avoid burning the
         // hourly slot on failed dispatches like blacklist hits or 5xx errors).
+        // Note: redisSet wrapper côté worker n'a pas d'option TTL native (interface
+        // simple key/value). Le cleanup se fait via la logique côté lecture :
+        //   - counterKey contient le hour-bucket dans son nom, donc une nouvelle clé
+        //     par heure → les anciennes clés deviennent inutiles naturellement
+        //   - throttleKey est lu avec `now - lastDispatchedAt < WORKER_PUMP1H_THROTTLE_MS`
+        //     donc une vieille valeur n'a aucun effet après 60min
+        // Les clés s'accumulent dans Redis mais leur volume reste négligeable
+        // (max 24 buckets horaires/jour + max 1 clé throttle par symbole tradé).
         try {
-          await redisSet(counterKey, currentCount + 1, { ex: 60 * 60 });  // 1h TTL
-          await redisSet(throttleKey, now, { ex: 2 * 60 * 60 });  // 2h TTL (covers throttle window with margin)
+          await redisSet(counterKey, currentCount + 1);
+          await redisSet(throttleKey, now);
         } catch (err) {
           logger.warn("Pump-1h counter update failed (non-fatal)", { symbol, err: (err as Error).message });
         }
