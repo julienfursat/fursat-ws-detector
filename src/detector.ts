@@ -1196,18 +1196,36 @@ export class Detector {
         return;
       }
 
-      // Build payload — sub-minute reasonCodes don't use change30min/15m/1h, set null.
-      // pnlMax/pnlMin are tracked by fast-exit-evaluator's PnlTracker, not here. We omit
-      // them rather than sending stale/wrong values; fast-exit.ts treats them as optional.
+      // Build payload — sub-minute reasonCodes use change30min/15m/1h from snap (RingBuffer).
+      // BACKLOG-3 phase 5+ (2026-05-04): pnlMax/pnlMin populated from PnlTracker (wired
+      // via setPnlTracker() from worker-index.ts). Previously these were null because we
+      // didn't have the tracker reference here. Now both fast_sl bypass logic AND
+      // sellMeta instrumentation get the proper values.
+      let pnlMaxForPayload: number | undefined;
+      let pnlMinForPayload: number | undefined;
+      if (this.pnlTracker) {
+        try {
+          const tracked = this.pnlTracker.get(symbol);
+          if (tracked) {
+            pnlMaxForPayload = tracked.pnlMax;
+            pnlMinForPayload = tracked.pnlMin;
+          }
+        } catch { /* non-fatal */ }
+      }
       const payload: FastExitDispatchPayload = {
         symbol,
         reasonCode: verdict.reasonCode,
         pnlPct,
         avgBuyPrice,
         currentPrice: snap.currentPrice,
-        change1h: null,
-        change15m: null,
-        change30min: null,
+        // change30min/15m/1h: read from snap (RingBuffer maintains these).
+        // Note: change30min may not always be available (depends on RingBuffer history depth);
+        // the fallback to null is preserved if the snap field is itself null.
+        change1h: snap.change1h ?? null,
+        change15m: snap.change15m ?? null,
+        change30min: snap.change30min ?? null,
+        pnlMax: pnlMaxForPayload,
+        pnlMin: pnlMinForPayload,
         holdingSince: 0,  // unknown to detector; fast-exit.ts only uses this for logging
       };
 
