@@ -386,6 +386,13 @@ export interface MomentumCandidate {
   // (crashes, position_crash, major_pump on BTC) where the source is implicit.
   // BACKLOG-3 phase 2 (2026-05-01): "30s" added for early_pump dispatches by the WS worker.
   triggerSource: "5m" | "15m" | "1h" | "30s" | null;
+  /**
+   * BACKLOG-3 phase 5+ (2026-05-04) — Optional market context annotation.
+   * Set by evaluateEarlyEntry when BTC/ETH context is available. Propagated to
+   * the entry payload so tradeMeta.marketContext can be populated for offline
+   * analysis. Soft signal, never blocks dispatch.
+   */
+  marketContext?: "favorable" | "warning" | "neutral";
 }
 
 // Agent position with enough context to evaluate fast-exit rules.
@@ -432,6 +439,19 @@ export interface ClassifyInput {
   isMajor: boolean;
   drawdownFromPeak: number;     // negative if below peak, 0 or positive if at/above
   peakSampleCount: number;
+  // BACKLOG-3 phase 5+ (2026-05-04) — Market context (BTC/ETH) for log-only filtering.
+  // Worker passes these via getSnapshot('BTC') / getSnapshot('ETH') from RingBuffer.
+  // Used by evaluateEarlyEntry to log a "red zone" warning when ETH/BTC c24h is in
+  // the empirical bad range [0%, +2%] (cf. analyse 14j multi-signaux 04/05).
+  // Soft filter only: NEVER blocks the trade. Persisted for offline pattern verification.
+  btcContext30m?: number | null;
+  btcContext1h?: number | null;
+  btcContext6h?: number | null;
+  btcContext24h?: number | null;
+  ethContext30m?: number | null;
+  ethContext1h?: number | null;
+  ethContext6h?: number | null;
+  ethContext24h?: number | null;
 }
 
 /**
@@ -854,6 +874,22 @@ export interface EarlyEntryResult {
   isEarly: boolean;
   /** Tag explicatif pour les logs */
   reason: string;
+  /**
+   * BACKLOG-3 phase 5+ (2026-05-04) — Soft market context indicator.
+   * NEVER blocks the trade. Just an annotation for the logs and downstream
+   * dashboard so we can correlate trade outcomes with market regime.
+   *
+   * Possible values:
+   *   - undefined  : no BTC/ETH context provided (e.g. scan.ts dispatches)
+   *   - "favorable": BTC and ETH c24h both NOT in the empirical "danger zone"
+   *   - "warning"  : BTC c24h OR ETH c24h in [0%, +2%] (zone where 14j sample
+   *                   showed -$95 PnL on 64 trades, vs -$55 on 52 trades elsewhere)
+   *   - "neutral"  : context provided but values not deeply discriminant
+   *
+   * Caller can persist this in tradeMeta.marketContext for offline analysis.
+   * No filter logic acts on this value yet -- collection phase only.
+   */
+  marketContext?: "favorable" | "warning" | "neutral";
 }
 
 /**
@@ -942,9 +978,62 @@ export function evaluateEarlyEntry(input: ClassifyInput): EarlyEntryResult {
     };
   }
 
+  // BACKLOG-3 phase 5+ (2026-05-04) — Soft market context annotation.
+  // NEVER blocks the trade. Computed only if BTC AND ETH context provided
+  // (worker-dispatched signals; scan.ts won't have these).
+  //
+  // Background (analyse 14j multi-signaux 04/05):
+  //   - 64 trades dispatched while ETH c24h in [0%, +2%]: PnL total = -$95
+  //   - 52 trades elsewhere: PnL total = -$55
+  //   - BTC c24h shows similar pattern in [0%, +2%]
+  //   - Hypothesis: in moderate-bull regime, capital flows to BTC; altcoin
+  //     pumps are "rotation drag" rather than independent rallies, hence
+  //     entries get caught at the late phase
+  //
+  // PRIORITY: c24h is the primary signal (most discriminant in 14j sample).
+  // FALLBACK: if c24h unavailable (likely until RingBuffer is extended), use c1h
+  // as a poor proxy. The "danger zone" thresholds are different (less data on c1h).
+  //
+  // CRITICAL: This is OBSERVATION ONLY. We do NOT skip the trade. The annotation
+  // is propagated to tradeMeta.marketContext where it can be analyzed against
+  // 50+ future trades to validate (or refute) the pattern.
+  let marketContext: "favorable" | "warning" | "neutral" | undefined;
+  const btc24h = input.btcContext24h;
+  const eth24h = input.ethContext24h;
+  const btc1h = input.btcContext1h;
+  const eth1h = input.ethContext1h;
+
+  if (btc24h !== null && btc24h !== undefined && eth24h !== null && eth24h !== undefined) {
+    // Primary path: 24h context available
+    const btcInDangerZone = btc24h >= 0 && btc24h < 2;
+    const ethInDangerZone = eth24h >= 0 && eth24h < 2;
+    if (ethInDangerZone || btcInDangerZone) {
+      marketContext = "warning";
+    } else if (btc24h <= 0 || eth24h <= 0) {
+      marketContext = "favorable";
+    } else {
+      marketContext = "neutral";
+    }
+  } else if (btc1h !== null && btc1h !== undefined && eth1h !== null && eth1h !== undefined) {
+    // Fallback path: only c1h available (less reliable). Same thresholds, narrower band.
+    // 14j sample showed BTC c1h sweet spot around [0%, +0.25%] with WR 41% vs <30% elsewhere.
+    // We mark as "warning" if BOTH BTC and ETH c1h fall outside the calm-bull zone.
+    const btcCalm = btc1h >= -0.25 && btc1h < 0.25;
+    const ethCalm = eth1h >= -0.25 && eth1h < 0.25;
+    if (btcCalm && ethCalm) {
+      marketContext = "favorable";
+    } else if (Math.abs(btc1h) > 0.5 || Math.abs(eth1h) > 0.5) {
+      marketContext = "warning";
+    } else {
+      marketContext = "neutral";
+    }
+  }
+  // else: no context provided, marketContext stays undefined (e.g. scan.ts dispatches)
+
   return {
     isEarly: true,
-    reason: `early_pump: 30s=${change30s.toFixed(2)}% 2m=${change2min.toFixed(2)}% 5m=${change5m?.toFixed(2) ?? "n/a"}%`,
+    reason: `early_pump: 30s=${change30s.toFixed(2)}% 2m=${change2min.toFixed(2)}% 5m=${change5m?.toFixed(2) ?? "n/a"}%${marketContext ? ` [mkt=${marketContext}]` : ""}`,
+    marketContext,
   };
 }
 

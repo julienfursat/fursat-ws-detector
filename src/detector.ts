@@ -416,6 +416,13 @@ export class Detector {
     // from the tick payload (already in the WS message).
     const change24h = 0;
 
+    // BACKLOG-3 phase 5+ (2026-05-04) — Market context (BTC/ETH) for soft signal.
+    // Read from RingBuffer same as `snap` (the current asset). If BTC/ETH not in
+    // tradable universe (very unlikely), context stays null and downstream
+    // marketContext annotation will simply be undefined (no impact on dispatch).
+    const btcSnap = this.ringBuffers.getSnapshot("BTC");
+    const ethSnap = this.ringBuffers.getSnapshot("ETH");
+
     const input: ClassifyInput = {
       symbol,
       currentPrice: snap.currentPrice,
@@ -432,6 +439,15 @@ export class Detector {
       isMajor,
       drawdownFromPeak: snap.drawdownFromPeak,
       peakSampleCount: snap.peakSampleCount,
+      // BTC/ETH market context — soft signal for evaluateEarlyEntry annotation.
+      btcContext30m: btcSnap?.change30min ?? null,
+      btcContext1h: btcSnap?.change1h ?? null,
+      btcContext6h: (btcSnap as any)?.change6h ?? null,    // RingBuffer may not yet expose 6h
+      btcContext24h: (btcSnap as any)?.change24h ?? null,  // ditto for 24h
+      ethContext30m: ethSnap?.change30min ?? null,
+      ethContext1h: ethSnap?.change1h ?? null,
+      ethContext6h: (ethSnap as any)?.change6h ?? null,
+      ethContext24h: (ethSnap as any)?.change24h ?? null,
     };
 
     const result = classifySignal(input);
@@ -542,6 +558,10 @@ export class Detector {
           drawdownFromPeak: snap.drawdownFromPeak,
           peakSampleCount: snap.peakSampleCount,
           triggerSource: "30s",
+          // BACKLOG-3 phase 5+ (2026-05-04) — propagate soft market signal to entry.ts
+          // for tradeMeta.marketContext. Stays undefined when BTC/ETH context not in
+          // RingBuffer (e.g. early in the session before BTC ticks have populated).
+          marketContext: earlyVerdict.marketContext,
         };
         logger.info("⚡ EARLY DISPATCH", {
           symbol, ...{
@@ -550,6 +570,9 @@ export class Detector {
             change2min: snap.change2min?.toFixed(2),
             change5m: snap.change5m?.toFixed(2),
             volume24h: Math.round(snap.volume24h / 1000) + "k",
+            mkt: earlyVerdict.marketContext ?? "n/a",  // BACKLOG-3 phase 5+
+            btc1h: input.btcContext1h?.toFixed(2) ?? "n/a",
+            eth1h: input.ethContext1h?.toFixed(2) ?? "n/a",
             reason: earlyVerdict.reason,
           },
         });
@@ -870,6 +893,13 @@ export class Detector {
       // narrow union but accepted by entry.ts as a string. Cast each field individually
       // and use a separate object so we can attach the sub-minute deltas (which DispatchSignal
       // also doesn't formally declare). entry.ts reads them via dynamic property access.
+      //
+      // BACKLOG-3 phase 5+ (2026-05-04) — Also attach BTC/ETH context + marketContext
+      // (soft annotation). Even though DispatchSignal doesn't declare them, entry.ts
+      // reads any extra fields via dynamic access and can persist them in tradeMeta.
+      // Worker reads context from RingBuffer at dispatch time, so values are fresh.
+      const btcSnapAtDispatch = this.ringBuffers.getSnapshot("BTC");
+      const ethSnapAtDispatch = this.ringBuffers.getSnapshot("ETH");
       const signal = {
         symbol,
         change5m: c.change5m,
@@ -887,6 +917,15 @@ export class Detector {
         change30s: c.change30s,
         change1min: c.change1min,
         change2min: c.change2min,
+        // BACKLOG-3 phase 5+ (2026-05-04) — extra context for tradeMeta enrichment.
+        // marketContext: "favorable" | "warning" | "neutral" | undefined.
+        marketContext: c.marketContext,
+        // Raw BTC/ETH window changes -- entry.ts may persist these so we can analyze
+        // any future filter without having to re-fetch via Coinbase API.
+        btcChange30m: btcSnapAtDispatch?.change30min ?? null,
+        btcChange1h: btcSnapAtDispatch?.change1h ?? null,
+        ethChange30m: ethSnapAtDispatch?.change30min ?? null,
+        ethChange1h: ethSnapAtDispatch?.change1h ?? null,
       } as DispatchSignal;
       const result = await dispatchEntry(signal);
 
