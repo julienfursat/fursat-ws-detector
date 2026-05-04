@@ -133,6 +133,11 @@ export const FASTPATH_LOG_MIN_CHANGE1H = -3.0;
 // The "change5m < 4%" cap is critical — it ensures we're EARLY and not just
 // duplicating the classical pumpdetection.
 export const EARLY_ENTRY_MIN_CHANGE30S = 1.0;       // %, last 30 seconds
+// BACKLOG-3 phase 5+ (2026-05-04) — MAX cap on change30s for early entry.
+// See evaluateEarlyEntry (rule "flash_spike_30s") for full justification.
+// Above 2%, change30s signals a flash spike (manipulation/bot/wash) rather
+// than a sustained pump. Distribution showed 0% WR on bucket [2%, 3%].
+export const EARLY_ENTRY_MAX_CHANGE30S = 2.0;       // %, exclude flash spikes
 export const EARLY_ENTRY_MIN_CHANGE2MIN = 2.0;      // %, last 2 minutes
 // BACKLOG-3 phase 3 (2026-05-02) — Anti "isolated candle" filter.
 // When change30s, change1min and change2min are all within EPS of each other,
@@ -220,6 +225,14 @@ export const SLOW_DOWN_VELOCITY_RATIO = 0.5;        // v30s / v2m must be below 
 export const FAST_TP_PNL_PCT = 5.0;                 // pnl_pct that triggers immediate take-profit
 export const FAST_SL_CHANGE30S_PCT = -1.0;          // change30s that triggers safety stop
 export const FAST_SL_MIN_PNL_PCT = -3.0;            // only fire fast_sl if pnl is not already disaster
+
+// BACKLOG-3 phase 5+ (2026-05-04) — pnl_max bypass threshold for fast_sl.
+// If the position has already touched +2% pnl_max, fast_sl is BYPASSED
+// (let ratchet/no_pump_exit handle the position instead). This protects
+// us from cutting positions that have proven they can pump but are
+// experiencing intra-pump retracements. See SlowDownExitContext.pnlMax
+// for full justification (5/13 fast_sl with pic ≥ +5% in 14j sample).
+export const FAST_SL_PNL_MAX_BYPASS = 2.0;
 
 // ─── PUMP-1H DEDICATED EXIT THRESHOLDS (NEW 2026-05-03) ────────────────────────
 // Sustained pumps (TROLL +69%/24h, AI +26%/24h on 03/05) need different exit
@@ -899,6 +912,19 @@ export function evaluateEarlyEntry(input: ClassifyInput): EarlyEntryResult {
   if (change30s < EARLY_ENTRY_MIN_CHANGE30S) {
     return { isEarly: false, reason: `slow_30s:${change30s.toFixed(2)}%` };
   }
+  // BACKLOG-3 phase 5+ (2026-05-04) — MAX cap on change30s.
+  // Distribution analysis on 14j of production:
+  //   change30s 1.0-1.5% : 26 trades, WR 38%, total -$4 (almost breakeven)
+  //   change30s 1.5-2.0% : 22 trades, WR 14%, total -$21
+  //   change30s 2.0-3.0% : 13 trades, WR 0%,  total -$25  ← guaranteed loss
+  //   change30s 3.0-5.0% : 1 trade, WR 100%, +$5            ← single outlier
+  // Above 2%, the change30s signals a flash spike (manipulation, wash trade,
+  // or bot activity) rather than a sustained pump. Real pumps START slow
+  // (1-1.5% on 30s) and accelerate. Capping at 2% eliminates 13 guaranteed-loss
+  // trades for the cost of 1 outlier (RLS +$5 on 03/05 — likely random luck).
+  if (change30s >= EARLY_ENTRY_MAX_CHANGE30S) {
+    return { isEarly: false, reason: `flash_spike_30s:${change30s.toFixed(2)}%` };
+  }
   if (change2min < EARLY_ENTRY_MIN_CHANGE2MIN) {
     return { isEarly: false, reason: `slow_2m:${change2min.toFixed(2)}%` };
   }
@@ -1020,6 +1046,22 @@ export interface SlowDownExitContext {
   change1min: number | null;
   change2min: number | null;
   /**
+   * BACKLOG-3 phase 5+ (2026-05-04) — PnL maximum atteint depuis l'entrée.
+   * Lu depuis pnl_tracker (Redis) côté worker. Utilisé par fast_sl pour
+   * éviter de couper une position qui a déjà touché +2% (le fast_sl est
+   * conçu pour les retournements violents AVANT que la position décolle ;
+   * une fois décollée, c'est le ratchet/no_pump_exit qui doit gérer).
+   *
+   * Découverte motivation : sur 13 fast_sl reconstruits via dryrun logs,
+   * 5 (38%) avaient atteint +5% post-BUY. Le fast_sl coupait pendant des
+   * micro-corrections intra-pump normales (-1%/30s sur un pump qui faisait
+   * +5% à +13% au total). Cas concrets : GIGA -$0.79 (pic +12.9%), BOBA
+   * -$1.12 (pic +9.4%), ELA -$1.52 (pic +5.8%), AKT -$0.39 (pic +5.1%).
+   *
+   * Si undefined ou < 2%, fast_sl conserve son comportement standard.
+   */
+  pnlMax?: number;
+  /**
    * PUMP-1H DETECTOR (NEW 2026-05-03) — Optional dispatch source.
    * When "worker-pump1h", uses dedicated thresholds:
    *   - fast_tp triggers at +15% (vs +5% for sub-min)
@@ -1054,7 +1096,7 @@ export interface SlowDownExitVerdict {
  * Otherwise unchanged (no regression on early_pump positions).
  */
 export function evaluateSlowDownExit(ctx: SlowDownExitContext): SlowDownExitVerdict | null {
-  const { pnlPct, change30s, change1min, change2min, dispatchSource } = ctx;
+  const { pnlPct, change30s, change1min, change2min, pnlMax, dispatchSource } = ctx;
 
   // Need sub-minute data to reason about velocity
   if (change30s == null || change1min == null || change2min == null) {
@@ -1077,11 +1119,24 @@ export function evaluateSlowDownExit(ctx: SlowDownExitContext): SlowDownExitVerd
   // Rule 2: fast_sl — violent reversal sub-1min, sortie d'urgence avant que fast_stop_loss
   // (qui a besoin de change1h ≤ -8% AND pnl ≤ -10%) ne kicke. Sauve typiquement 5-7 points
   // de perte sur les retournements brutaux. UNCHANGED for pump1h (still a useful safety net).
+  //
+  // BACKLOG-3 phase 5+ (2026-05-04) — NEW guard: skip fast_sl if pnl_max already
+  // touched +2%. Justification (analyse 14j sur 13 samples reconstitués via dryrun
+  // logs): 5/13 fast_sl avaient pic post-BUY ≥ +5%, swing potentiel +$24 sur le sample.
+  // Le fast_sl coupait pendant micro-corrections intra-pump normales sur des positions
+  // qui décollaient. La nouvelle règle laisse le ratchet (drawdown depuis pic) ou
+  // fast_no_pump_exit (timeout 30min) gérer ces positions au lieu de couper sub-min.
+  // Conservé strictly when pnlMax < 2 ou undefined (compat ascendante).
   if (change30s <= FAST_SL_CHANGE30S_PCT && pnlPct >= FAST_SL_MIN_PNL_PCT) {
-    return {
-      reasonCode: "fast_sl",
-      detail: `change30s=${change30s.toFixed(2)}% ≤ ${FAST_SL_CHANGE30S_PCT}%, pnl=${pnlPct.toFixed(2)}%${isPump1h ? " [pump1h]" : ""}`,
-    };
+    if (pnlMax !== undefined && pnlMax >= FAST_SL_PNL_MAX_BYPASS) {
+      // Skip fast_sl: position has already proven it can move up. Let ratchet handle.
+      // No return here — fall through to fast_slow_down rule.
+    } else {
+      return {
+        reasonCode: "fast_sl",
+        detail: `change30s=${change30s.toFixed(2)}% ≤ ${FAST_SL_CHANGE30S_PCT}%, pnl=${pnlPct.toFixed(2)}%, pnl_max=${pnlMax?.toFixed(2) ?? "n/a"}%${isPump1h ? " [pump1h]" : ""}`,
+      };
+    }
   }
 
   // Rule 3: fast_slow_down — pump still positive but velocity collapsing

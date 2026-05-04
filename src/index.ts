@@ -101,13 +101,6 @@ async function main(): Promise<void> {
   await pnlTracker.loadFromRedis();
   pnlTracker.start();
 
-  // BACKLOG-3 phase 3.1 (2026-05-02) — Trou B fix: wire pnlTracker into positions
-  // so applyNewPositions() prunes stale entries on every poll (5s) instead of
-  // waiting for the 5-min stats timer (line 141 below). Tightens the window
-  // during which a same-symbol re-BUY could inherit a stale pnlMax from the
-  // previous position and trigger a false fast_ratchet on the first tick.
-  positions.setPnlTracker(pnlTracker);
-
   // 8. Detector (BUY entry as in 2B)
   // BACKLOG-3 phase 3 (2026-05-02) — Pass positions to the detector so that
   // tryDispatchSlowDown uses the same source of truth as fast-exit-evaluator.
@@ -115,6 +108,11 @@ async function main(): Promise<void> {
   // had a 60s null-cache pitfall when called right after a worker BUY).
   const heldSymbolsProvider = (): Set<string> => positions.getHeldSymbols();
   const detector = new Detector(ringBuffers, symbols, heldSymbolsProvider, positions);
+  // BACKLOG-3 phase 5+ (2026-05-04) — Wire PnlTracker so tryDispatchSlowDown
+  // can read pnl_max for fast_sl bypass (don't cut positions that already
+  // touched +2%). Non-breaking: detector falls back to undefined pnl_max if
+  // setter not called (no regression on legacy behavior).
+  detector.setPnlTracker(pnlTracker);
   detector.start();
 
   // 9. Fast-exit evaluator (real-time SELL on every tick of held assets)

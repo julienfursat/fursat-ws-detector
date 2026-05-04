@@ -33,6 +33,9 @@ import { isBlacklisted } from "./blacklist.js";
 import { dispatchEntry, type DispatchSignal } from "./dispatcher.js";
 import { dispatchFastExit, isInFastExitCooldown, type FastExitDispatchPayload } from "./fast-exit-dispatcher.js";
 import type { PositionsTracker } from "./positions.js";
+// BACKLOG-3 phase 5+ (2026-05-04) — type-only import for fast_sl pnl_max bypass.
+// Set via setPnlTracker() after construction; null-safe in tryDispatchSlowDown.
+import type { PnlTracker } from "./pnl-tracker.js";
 
 // BACKLOG-3 phase 3 (2026-05-02) — Worker-side kill switch on classical alt_pump dispatches.
 // Mirrors the scan.ts SCAN_ALT_PUMP_BUY_ENABLED flag. The classical 5m/15m/1h
@@ -271,6 +274,10 @@ export class Detector {
   // Optional for backwards compatibility — when absent, slow-down evaluation
   // falls back to the legacy getAvgBuyPrice path.
   private positions: PositionsTracker | null = null;
+  // BACKLOG-3 phase 5+ (2026-05-04) — Optional PnlTracker reference for
+  // fast_sl pnl_max bypass. Set via setPnlTracker() in worker-index.ts.
+  // When null, pnl_max stays undefined and fast_sl behaves as before.
+  private pnlTracker: PnlTracker | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
 
   // Pending log entries (flushed every FLUSH_INTERVAL_MS)
@@ -341,6 +348,19 @@ export class Detector {
    */
   setTradableSymbols(symbols: Set<string>): void {
     this.tradableSymbols = symbols;
+  }
+
+  /**
+   * BACKLOG-3 phase 5+ (2026-05-04) — Optional setter for the PnlTracker
+   * (lives in fast-exit-evaluator). Used by tryDispatchSlowDown to read
+   * pnl_max so fast_sl can be bypassed when pnl_max ≥ FAST_SL_PNL_MAX_BYPASS.
+   *
+   * Non-breaking: if not called, pnl_max stays undefined and fast_sl behaves
+   * exactly as before (no regression). The wiring is done in worker-index.ts
+   * after both the Detector and FastExitEvaluator are instantiated.
+   */
+  setPnlTracker(tracker: PnlTracker): void {
+    this.pnlTracker = tracker;
   }
 
   /**
@@ -1133,12 +1153,25 @@ export class Detector {
       // dispatchSource undefined → uses standard sub-min thresholds
     }
 
+    // BACKLOG-3 phase 5+ (2026-05-04) — Read pnl_max from tracker (optional).
+    // Used by fast_sl bypass (don't cut a position that has already proven
+    // it can pump). If pnlTracker not wired, stays undefined → fast_sl behaves
+    // as before (no regression).
+    let pnlMax: number | undefined;
+    if (this.pnlTracker) {
+      try {
+        const tracked = this.pnlTracker.get(symbol);
+        if (tracked) pnlMax = tracked.pnlMax;
+      } catch { /* non-fatal */ }
+    }
+
     const verdict = evaluateSlowDownExit({
       pnlPct,
       change30s: snap.change30s,
       change1min: snap.change1min,
       change2min: snap.change2min,
-      dispatchSource,  // PUMP-1H DETECTOR (2026-05-03) — router for exit thresholds
+      pnlMax,         // BACKLOG-3 phase 5+ (2026-05-04) — fast_sl bypass when ≥ +2%
+      dispatchSource, // PUMP-1H DETECTOR (2026-05-03) — router for exit thresholds
     });
 
     if (!verdict) return;
