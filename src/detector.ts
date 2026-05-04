@@ -1196,11 +1196,17 @@ export class Detector {
         return;
       }
 
-      // Build payload — sub-minute reasonCodes use change30min/15m/1h from snap (RingBuffer).
+      // Build payload — sub-minute reasonCodes use change30min/15m/1h from full RingBuffer snapshot.
       // BACKLOG-3 phase 5+ (2026-05-04): pnlMax/pnlMin populated from PnlTracker (wired
       // via setPnlTracker() from worker-index.ts). Previously these were null because we
       // didn't have the tracker reference here. Now both fast_sl bypass logic AND
       // sellMeta instrumentation get the proper values.
+      //
+      // NOTE: the `snap` parameter passed to this method is a sub-set type
+      // {currentPrice, change30s, change1min, change2min} (see line ~1115). For longer
+      // windows we need the full snapshot, fetched fresh from the RingBuffer here.
+      // Cost: ~one map lookup. Returns null if symbol unknown -- in that case we leave
+      // longer-window changes as null.
       let pnlMaxForPayload: number | undefined;
       let pnlMinForPayload: number | undefined;
       if (this.pnlTracker) {
@@ -1212,18 +1218,17 @@ export class Detector {
           }
         } catch { /* non-fatal */ }
       }
+      const fullSnap = this.ringBuffers.getSnapshot(symbol);
       const payload: FastExitDispatchPayload = {
         symbol,
         reasonCode: verdict.reasonCode,
         pnlPct,
         avgBuyPrice,
         currentPrice: snap.currentPrice,
-        // change30min/15m/1h: read from snap (RingBuffer maintains these).
-        // Note: change30min may not always be available (depends on RingBuffer history depth);
-        // the fallback to null is preserved if the snap field is itself null.
-        change1h: snap.change1h ?? null,
-        change15m: snap.change15m ?? null,
-        change30min: snap.change30min ?? null,
+        // change30min/15m/1h: read from RingBuffer full snapshot
+        change1h: fullSnap?.change1h ?? null,
+        change15m: fullSnap?.change15m ?? null,
+        change30min: fullSnap?.change30min ?? null,
         pnlMax: pnlMaxForPayload,
         pnlMin: pnlMinForPayload,
         holdingSince: 0,  // unknown to detector; fast-exit.ts only uses this for logging
