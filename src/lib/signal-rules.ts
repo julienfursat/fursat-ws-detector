@@ -165,6 +165,20 @@ export const EARLY_ENTRY_MAX_VOLUME_24H = 5_000_000_000; // $5B
 export const EARLY_ENTRY_MIN_DRAWDOWN_PCT = -2.0;   // %, recent peak still close
 export const EARLY_ENTRY_MIN_CHANGE1H = -3.0;       // %, no dead-cat-bounce
 
+// BACKLOG-3 phase 6 (2026-05-05) — Quality threshold on change1h.
+// Empirical analysis 4.9j (123 trades): trades with change1h < 3% are systematically
+// loss-makers (bucket [0-1%): -$8/8 trades = -$1/trade; bucket [1-3%): -$26/35 trades = -$0.73/trade).
+// Trades with c1h ≥ 3% have less negative outcomes (bucket [3-5%): -$8.5/20 = -$0.42; bucket [5-10%): 
+// -$11/13 = -$0.85; bucket [10+]: +$0.77/8 = ALMOST POSITIVE).
+// Cross-check 14j (116 trades) showed identical pattern.
+// Setting threshold at 3% would have skipped 35 trades / saved $40 over the window.
+// The threshold may need tuning over time but 3% is a reasonable starting point.
+//
+// IMPORTANT: this is in addition to MIN_CHANGE1H = -3% (anti dead-cat-bounce safeguard).
+// MIN_CHANGE1H_QUALITY is stricter; passing both means c1h is in [QUALITY, +inf), which
+// is the strict-positive zone where we want to play.
+export const EARLY_ENTRY_MIN_CHANGE1H_QUALITY = 3.0; // %, quality filter (anti queue-of-weakness)
+
 // ─── PUMP-1H ENTRY (NEW 2026-05-03) ───────────────────────────────────────────
 // Detects sustained pumps (30-60min duration) that the EARLY_ENTRY path rejects.
 // Rationale: the EARLY_ENTRY filter "change5m < 4%" rejects assets that have
@@ -940,6 +954,15 @@ export function evaluateEarlyEntry(input: ClassifyInput): EarlyEntryResult {
   if (change1h !== null && change1h <= EARLY_ENTRY_MIN_CHANGE1H) {
     return { isEarly: false, reason: `dead_cat_bounce:c1h=${change1h.toFixed(1)}%` };
   }
+  // BACKLOG-3 phase 6 (2026-05-05) — quality threshold on change1h.
+  // Filters out "queue of weakness" entries where the 1h trend is too weak to
+  // sustain a sub-min pump. See MIN_CHANGE1H_QUALITY constant comment for empirical
+  // rationale (4.9j + 14j analysis converging on c1h<3% being a loss zone).
+  // If change1h is null (data not available) we let the trade through (don't
+  // filter on missing data). Otherwise enforce the threshold.
+  if (change1h !== null && change1h < EARLY_ENTRY_MIN_CHANGE1H_QUALITY) {
+    return { isEarly: false, reason: `weak_1h:c1h=${change1h.toFixed(1)}%<${EARLY_ENTRY_MIN_CHANGE1H_QUALITY}%` };
+  }
   // The "EARLY" gate: must NOT have already triggered classical paths
   if (change5m !== null && change5m >= EARLY_ENTRY_MAX_CHANGE5M) {
     return { isEarly: false, reason: `not_early:c5m=${change5m.toFixed(1)}%` };
@@ -1207,7 +1230,7 @@ export function evaluateSlowDownExit(ctx: SlowDownExitContext): SlowDownExitVerd
 
   // Rule 2: fast_sl — violent reversal sub-1min, sortie d'urgence avant que fast_stop_loss
   // (qui a besoin de change1h ≤ -8% AND pnl ≤ -10%) ne kicke. Sauve typiquement 5-7 points
-  // de perte sur les retournements brutaux. UNCHANGED for pump1h (still a useful safety net).
+  // de perte sur les retournements brutaux.
   //
   // BACKLOG-3 phase 5+ (2026-05-04) — NEW guard: skip fast_sl if pnl_max already
   // touched +2%. Justification (analyse 14j sur 13 samples reconstitués via dryrun
@@ -1216,14 +1239,24 @@ export function evaluateSlowDownExit(ctx: SlowDownExitContext): SlowDownExitVerd
   // qui décollaient. La nouvelle règle laisse le ratchet (drawdown depuis pic) ou
   // fast_no_pump_exit (timeout 30min) gérer ces positions au lieu de couper sub-min.
   // Conservé strictly when pnlMax < 2 ou undefined (compat ascendante).
-  if (change30s <= FAST_SL_CHANGE30S_PCT && pnlPct >= FAST_SL_MIN_PNL_PCT) {
+  //
+  // BACKLOG-3 phase 6 (2026-05-05) — NEW guard: SKIP fast_sl entirely for pump1h.
+  // Justification: pump1h positions are deliberately taken in the middle of a sustained
+  // rally where drawdown jusqu'à -5% is expected by the entry detector. The fast_sl
+  // (change30s ≤ -1% AND pnl ≥ -3%) is too aggressive for this context — it kills
+  // pump1h positions in sub-minute. Empirical example 04/05: TROLL captured at 18:43,
+  // killed by fast_sl 1 minute later (-$1.54), B3 same fate (-$1.59). The pump1h has
+  // its own exit logic: fast_tp +15%, fast_ratchet (drawdown 4pt fixed once +5%),
+  // fast_no_pump_exit (no pump exit at 30min). These are sufficient. Removing fast_sl
+  // for pump1h gives the position room to breathe through normal pump volatility.
+  if (!isPump1h && change30s <= FAST_SL_CHANGE30S_PCT && pnlPct >= FAST_SL_MIN_PNL_PCT) {
     if (pnlMax !== undefined && pnlMax >= FAST_SL_PNL_MAX_BYPASS) {
       // Skip fast_sl: position has already proven it can move up. Let ratchet handle.
       // No return here — fall through to fast_slow_down rule.
     } else {
       return {
         reasonCode: "fast_sl",
-        detail: `change30s=${change30s.toFixed(2)}% ≤ ${FAST_SL_CHANGE30S_PCT}%, pnl=${pnlPct.toFixed(2)}%, pnl_max=${pnlMax?.toFixed(2) ?? "n/a"}%${isPump1h ? " [pump1h]" : ""}`,
+        detail: `change30s=${change30s.toFixed(2)}% ≤ ${FAST_SL_CHANGE30S_PCT}%, pnl=${pnlPct.toFixed(2)}%, pnl_max=${pnlMax?.toFixed(2) ?? "n/a"}%`,
       };
     }
   }
