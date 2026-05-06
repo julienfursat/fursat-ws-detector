@@ -33,7 +33,8 @@ import { EventFollowup } from "./event-followup.js";
 
 export type EventKind =
   | "early_explosive"
-  | "progressive_pump"
+  | "progressive_pump"     // slow build: c1h dominates c15m (EIGEN/BLEND/CHECK)
+  | "accelerating_pump"    // c15m dominates c1h: pump ramping up (KAIO style)
   | "stair_step"
   | "crash_rebound"
   | "new_listing_pump"
@@ -93,7 +94,8 @@ export interface ShadowEvent {
 // e.g. a sustained pump that satisfies progressive_pump rule for 30min in a row
 const THROTTLE_MS_PER_KIND: Record<EventKind, number> = {
   early_explosive: 5 * 60_000,    // 5 min
-  progressive_pump: 15 * 60_000,  // 15 min
+  progressive_pump: 15 * 60_000,  // 15 min — slow build, won't change quickly
+  accelerating_pump: 5 * 60_000,  // 5 min — ramping up, can re-fire faster
   stair_step: 10 * 60_000,        // 10 min
   crash_rebound: 30 * 60_000,     // 30 min
   new_listing_pump: 60 * 60_000,  // 1 h
@@ -123,6 +125,7 @@ export class EventDetector {
   private counters: Record<EventKind, number> = {
     early_explosive: 0,
     progressive_pump: 0,
+    accelerating_pump: 0,
     stair_step: 0,
     crash_rebound: 0,
     new_listing_pump: 0,
@@ -160,6 +163,9 @@ export class EventDetector {
 
       this.tryFire(symbol, "progressive_pump", snap, btcSnap, ethSnap, now,
         () => this.matchProgressivePump(snap));
+
+      this.tryFire(symbol, "accelerating_pump", snap, btcSnap, ethSnap, now,
+        () => this.matchAcceleratingPump(snap));
 
       this.tryFire(symbol, "stair_step", snap, btcSnap, ethSnap, now,
         () => this.matchStairStep(symbol, snap, now));
@@ -232,6 +238,36 @@ export class EventDetector {
       snap.change1h >= 3 &&
       snap.change5m >= 0.5 &&
       snap.change1h >= snap.change15m * 2
+    );
+  }
+
+  /**
+   * Accelerating pump: ramp-up where recent windows dominate older ones.
+   * Examples: KAIO with c5m=5.6, c15m=14.8, c1h=8.0 — most of the move
+   * happened in the last 15 minutes, c1h hasn't caught up yet.
+   *
+   * This is the classic alt_pump territory that the existing detector
+   * captures via change5m≥5%. We mirror it here in shadow mode so that
+   * the 13/05 analysis can compare:
+   *   • progressive_pump (slow build) PnL distribution
+   *   • accelerating_pump (ramp-up) PnL distribution
+   *   • early_explosive (sub-min spike) PnL distribution
+   *
+   * Rule: c5m in [2, 8) AND c15m ≥ 4 AND c15m > c1h (recent dominates).
+   * Upper bound on c5m avoids overlap with extreme cases that would also
+   * trigger early_explosive (c30s≥1, c5m<4 already covered there).
+   */
+  private matchAcceleratingPump(snap: PriceSnapshot): boolean {
+    if (snap.change5m == null || snap.change15m == null || snap.change1h == null) return false;
+    // Don't double-count early_explosive: if sub-min is loud, that's the right kind
+    if (snap.change30s != null && snap.change30s >= 1.5) return false;
+    // Don't double-count progressive_pump: that branch already fired
+    if (snap.change1h >= snap.change15m * 2) return false;
+    return (
+      snap.change5m >= 2 &&
+      snap.change5m < 8 &&
+      snap.change15m >= 4 &&
+      snap.change15m > snap.change1h
     );
   }
 
