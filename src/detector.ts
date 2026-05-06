@@ -1151,7 +1151,7 @@ export class Detector {
    */
   private async tryDispatchSlowDown(
     symbol: string,
-    snap: { currentPrice: number; change30s: number | null; change1min: number | null; change2min: number | null },
+    snap: { currentPrice: number; bestBid?: number | null; change30s: number | null; change1min: number | null; change2min: number | null },
     now: number,
   ): Promise<void> {
     // Tier 1: in-memory cooldown (30s) — cheap pre-filter

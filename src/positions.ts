@@ -68,6 +68,12 @@ export interface AgentPosition {
   buyTimestamp: number;
   pnlPct: number;            // computed from currentPrice
   valueUSD: number;          // units * currentPrice
+  // PUMP-1H DETECTOR (2026-05-03) — dispatch source from agent:trade_meta.
+  // "worker-pump1h" routes the position through pump1h-specific exit thresholds
+  // (FAST_RATCHET_PUMP1H_PNL_MAX_TRIGGER=5, drawdown 4pt fixed). Read by
+  // detector.tryDispatchSlowDown to decide which thresholds to apply.
+  // undefined for legacy/early_pump positions → standard sub-min thresholds.
+  dispatchSource?: string;
 }
 
 interface TradeMetaEntry {
