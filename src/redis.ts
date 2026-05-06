@@ -119,37 +119,47 @@ export async function writeHeartbeat(minIntervalMs = 30_000): Promise<boolean> {
 
 /**
  * Push value(s) to the LEFT of a Redis list. Used for shadow:events_completed.
+ * Returns true if write succeeded, false on failure (caller can then re-buffer
+ * or skip the LTRIM).
+ *
+ * NOTE: this signature must match what detector.ts already expects (boolean
+ * return for the buffer-on-failure pattern used for dryrun:* logs).
  */
-export async function redisLpush(key: string, value: unknown): Promise<void> {
+export async function redisLpush(key: string, value: unknown): Promise<boolean> {
   assertNotProtected(key);
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
   try {
     const payload = typeof value === "string" ? value : JSON.stringify(value);
-    await fetch(UPSTASH_URL, {
+    const res = await fetch(UPSTASH_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify(["LPUSH", key, payload]),
     });
+    return res.ok;
   } catch (err) {
     logger.warn("redisLpush failed", { key, err: (err as Error).message });
+    return false;
   }
 }
 
 /**
  * Trim a Redis list to a maximum length (keep most recent entries).
  * Use with redisLpush to maintain a rolling window.
+ * Returns true if write succeeded.
  */
-export async function redisLtrim(key: string, start: number, stop: number): Promise<void> {
+export async function redisLtrim(key: string, start: number, stop: number): Promise<boolean> {
   assertNotProtected(key);
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
   try {
-    await fetch(UPSTASH_URL, {
+    const res = await fetch(UPSTASH_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify(["LTRIM", key, String(start), String(stop)]),
     });
+    return res.ok;
   } catch (err) {
     logger.warn("redisLtrim failed", { key, err: (err as Error).message });
+    return false;
   }
 }
 
