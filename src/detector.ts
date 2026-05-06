@@ -67,6 +67,13 @@ const WORKER_PUMP1H_HOURLY_COUNTER_KEY = "worker:hourly_pump1h_count";
 const WORKER_PUMP1H_DISPATCHED_KEY_PREFIX = "worker:dispatched:pump1h:";  // + symbol
 const WORKER_PUMP1H_HOURLY_CAP = 5;
 const WORKER_PUMP1H_THROTTLE_MS = 60 * 60 * 1000;  // 60min per-asset
+
+// PASSIVE OBSERVATION MODE (BACKLOG-3 phase 8 — 2026-05-06)
+// Killswitch for early_pump dispatches (sub-minute fast-path BUYs). When false,
+// the detector still EVALUATES the rule (and logs to dryrun:early_dispatch_log
+// for retroactive analysis) but does NOT call dispatchEntry.
+// Defaults to true (existing behavior) — set to false in passive observation week.
+const WORKER_EARLY_PUMP_BUY_ENABLED = (process.env.WORKER_EARLY_PUMP_BUY_ENABLED ?? "true").toLowerCase() === "true";
 import {
   classifySignal,
   evaluateFastPathCandidate,
@@ -886,6 +893,17 @@ export class Detector {
         return;
       }
 
+      // PASSIVE OBSERVATION MODE (BACKLOG-3 phase 8 — 2026-05-06)
+      // When killswitch is off, log the would-be dispatch but skip the actual call.
+      // Pre-checks above (throttle, blacklist) still run so the data is comparable.
+      if (!WORKER_EARLY_PUMP_BUY_ENABLED) {
+        this.recordEarlyDispatch(now, this.candidateToInput(c), true, earlyReason, false, "killswitch_disabled");
+        logger.info("Early dispatch SKIPPED — killswitch off (passive mode)", {
+          symbol, change30s: c.change30s, change5m: c.change5m, change1h: c.change1h,
+        });
+        return;
+      }
+
       // All pre-checks passed — dispatch
       this.dispatchAttempted++;
       this.earlyDispatched++;
@@ -1151,7 +1169,7 @@ export class Detector {
    */
   private async tryDispatchSlowDown(
     symbol: string,
-    snap: { currentPrice: number; bestBid?: number | null; change30s: number | null; change1min: number | null; change2min: number | null },
+    snap: { currentPrice: number; change30s: number | null; change1min: number | null; change2min: number | null },
     now: number,
   ): Promise<void> {
     // Tier 1: in-memory cooldown (30s) — cheap pre-filter
@@ -1177,11 +1195,7 @@ export class Detector {
     let avgBuyPrice: number;
     let dispatchSource: string | undefined;  // PUMP-1H DETECTOR (2026-05-03)
     if (this.positions) {
-      // BACKLOG-3 phase 7 (2026-05-06) — pass bestBid so pnlPct is computed
-      // from the actual SELL-side price, not last_trade. This eliminates the
-      // "+48% partial-take fills at -1%" pattern observed on pump1h trades 05/05.
-      // Falls back to currentPrice when bestBid is null (rare).
-      const pos = this.positions.updatePriceForSymbol(symbol, snap.currentPrice, snap.bestBid);
+      const pos = this.positions.updatePriceForSymbol(symbol, snap.currentPrice);
       if (!pos) return;  // not held according to positions tracker
       pnlPct = pos.pnlPct;
       avgBuyPrice = pos.avgBuyPrice;
@@ -1225,19 +1239,7 @@ export class Detector {
 
     logger.info("⚡ SLOW-DOWN TRIGGER", {
       symbol, reasonCode: verdict.reasonCode, detail: verdict.detail,
-      pnl: pnlPct.toFixed(2),
-      price: snap.currentPrice,
-      // BACKLOG-3 phase 7+ (2026-05-06) — FULL DIAGNOSTIC for slippage debugging.
-      // We've seen pump1h fast_tp logs claiming "PnL=44%" while bestBid was $0.193 (BUY price).
-      // Root cause hypothesis: tick.bestBid spikes WITH last_trade on thin altcoins.
-      // These extra fields let us verify the hypothesis on the next occurrence.
-      bestBid: snap.bestBid,
-      avgBuyPrice: avgBuyPrice.toFixed(6),
-      pnlPctFromBestBid: snap.bestBid && snap.bestBid > 0
-        ? (((snap.bestBid - avgBuyPrice) / avgBuyPrice) * 100).toFixed(2)
-        : "n/a",
-      pnlPctFromCurrentPrice: (((snap.currentPrice - avgBuyPrice) / avgBuyPrice) * 100).toFixed(2),
-      dispatchSource: dispatchSource ?? "n/a",
+      pnl: pnlPct.toFixed(2), price: snap.currentPrice,
     });
 
     // Tier 2: Redis cooldown check (10min, shared with scan.ts and fast-exit-evaluator)
