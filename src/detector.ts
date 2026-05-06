@@ -1177,7 +1177,11 @@ export class Detector {
     let avgBuyPrice: number;
     let dispatchSource: string | undefined;  // PUMP-1H DETECTOR (2026-05-03)
     if (this.positions) {
-      const pos = this.positions.updatePriceForSymbol(symbol, snap.currentPrice);
+      // BACKLOG-3 phase 7 (2026-05-06) — pass bestBid so pnlPct is computed
+      // from the actual SELL-side price, not last_trade. This eliminates the
+      // "+48% partial-take fills at -1%" pattern observed on pump1h trades 05/05.
+      // Falls back to currentPrice when bestBid is null (rare).
+      const pos = this.positions.updatePriceForSymbol(symbol, snap.currentPrice, snap.bestBid);
       if (!pos) return;  // not held according to positions tracker
       pnlPct = pos.pnlPct;
       avgBuyPrice = pos.avgBuyPrice;

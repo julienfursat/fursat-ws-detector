@@ -43,6 +43,13 @@ interface AssetBuffers {
   symbol: string;
   currentPrice: number;
   currentVolume24h: number;
+  // BACKLOG-3 phase 7 (2026-05-06) — store bestBid alongside currentPrice.
+  // currentPrice = last_trade_price (used for trend signals: change30s/15m/1h).
+  // bestBid = WS ticker best_bid field (used for SELL pnl: actual price we'd
+  // receive on a market sell). Distinguishing the two avoids "fantom spike"
+  // partial-take/ratchet on thin orderbook altcoins (slippage observed up to
+  // 50pt on pump1h trades 05/05). Null until first tick provides it.
+  bestBid: number | null;
   // Short buffer — 5s granularity, 1h horizon. Used for 5m/15m/1h lookups.
   shortBuffer: Float64Array;
   shortHead: number;          // next write position
@@ -57,6 +64,10 @@ interface AssetBuffers {
 
 export interface PriceSnapshot {
   currentPrice: number;
+  // BACKLOG-3 phase 7 (2026-05-06) — bestBid (the actual SELL-side price).
+  // Null when not available yet (early in session, or thin moments without bids).
+  // Consumers should fallback to currentPrice when null.
+  bestBid: number | null;
   volume24h: number;
   // Sub-minute windows (NEW 2026-04-30 — log-only for now, BACKLOG-3 phase A)
   change30s: number | null;
@@ -83,14 +94,20 @@ export class RingBuffers {
   /**
    * Update the current price/volume for an asset on every tick.
    * Allocates the buffer lazily on first observation.
+   *
+   * BACKLOG-3 phase 7 (2026-05-06) — bestBid parameter:
+   * Stores best_bid from WS ticker alongside last_trade_price. Used by
+   * fast-exit-evaluator and detector.tryDispatchSlowDown to compute pnlPct
+   * from the actual sell-side price. Optional: null fallback ok.
    */
-  updateTick(symbol: string, price: number, volume24h: number, timestamp: number): void {
+  updateTick(symbol: string, price: number, volume24h: number, timestamp: number, bestBid?: number | null): void {
     let buf = this.buffers.get(symbol);
     if (!buf) {
       buf = {
         symbol,
         currentPrice: price,
         currentVolume24h: volume24h,
+        bestBid: bestBid ?? null,
         shortBuffer: new Float64Array(SHORT_BUFFER_SIZE).fill(NaN),
         shortHead: 0,
         shortFilledCount: 0,
@@ -103,6 +120,8 @@ export class RingBuffers {
     } else {
       buf.currentPrice = price;
       buf.currentVolume24h = volume24h;
+      // Only update bestBid when provided (some preload paths might not have it)
+      if (bestBid !== undefined && bestBid !== null) buf.bestBid = bestBid;
       buf.lastTickAt = timestamp;
     }
   }
@@ -150,6 +169,7 @@ export class RingBuffers {
 
     return {
       currentPrice: buf.currentPrice,
+      bestBid: buf.bestBid,  // BACKLOG-3 phase 7 — sell-side price for accurate PnL
       volume24h: buf.currentVolume24h,
       change30s, change1min, change2min,
       change5m, change15m, change30min, change1h, change4h,

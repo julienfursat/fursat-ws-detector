@@ -83,9 +83,17 @@ export class FastExitEvaluator {
   /**
    * Called on every tick (after the detector has had its turn).
    * If the symbol is a held position, update pnlMax/pnlMin and evaluate rules.
+   *
+   * BACKLOG-3 phase 7 (2026-05-06) — bestBid parameter:
+   * The bestBid is forwarded to PositionsTracker so pnlPct is computed from the
+   * actual ask we'd touch on a market SELL, not from last_trade_price (which can
+   * spike to fantom levels on thin orderbook altcoins). This eliminates the
+   * "+48% partial-take fills at -1%" pattern observed on pump1h trades 05/05.
+   *
+   * If bestBid is undefined or null, falls back to currentPrice (legacy behavior).
    */
-  evaluateTick(symbol: string, currentPrice: number): void {
-    const pos = this.positions.updatePriceForSymbol(symbol, currentPrice);
+  evaluateTick(symbol: string, currentPrice: number, bestBid?: number | null): void {
+    const pos = this.positions.updatePriceForSymbol(symbol, currentPrice, bestBid);
     if (!pos) return;  // not held
     this.ticksEvaluated++;
 
@@ -110,12 +118,6 @@ export class FastExitEvaluator {
       pnlPct: pos.pnlPct,
       valueUSD: pos.valueUSD,
       source: "trade_meta",  // worker only surveils positions present in trade_meta
-      // PUMP-1H DETECTOR (NEW 2026-05-03) — Pass dispatchSource through to rules.
-      // When "worker-pump1h", evaluateFastExitRules uses dedicated thresholds
-      // (FAST_RATCHET_PUMP1H_DRAWDOWN_PTS=5 fixed). When undefined or any other
-      // value, uses standard asymmetric ratchet (no behavioral change on
-      // existing early_pump positions).
-      dispatchSource: pos.dispatchSource,
     };
     const ctx: FastExitContext = {
       pnlMax: tracked.pnlMax,

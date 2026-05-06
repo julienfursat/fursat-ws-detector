@@ -68,10 +68,6 @@ export interface AgentPosition {
   buyTimestamp: number;
   pnlPct: number;            // computed from currentPrice
   valueUSD: number;          // units * currentPrice
-  // PUMP-1H DETECTOR (NEW 2026-05-03) — Optional dispatch source. When
-  // "worker-pump1h", fast-exit-evaluator routes to pump1h-specific exit
-  // thresholds. When undefined or any other value, uses standard thresholds.
-  dispatchSource?: string;
 }
 
 interface TradeMetaEntry {
@@ -79,10 +75,6 @@ interface TradeMetaEntry {
   symbol?: string;
   avgBuyPrice?: number;
   buyTimestamp?: number;
-  // PUMP-1H DETECTOR (NEW 2026-05-03) — read by pollFromTradeMeta to populate
-  // AgentPosition.dispatchSource. Set by entry.ts (Vercel) when storing a BUY
-  // dispatched from worker-pump1h or worker-early.
-  dispatchSource?: string;
 }
 
 interface CoinbaseAccount {
@@ -147,13 +139,34 @@ export class PositionsTracker {
    * Updates the currentPrice and pnlPct for a position, in-place.
    * Called by the fast-exit evaluator on every tick of a held asset.
    * Returns the updated position, or undefined if symbol not held.
+   *
+   * BACKLOG-3 phase 7 (2026-05-06) — sellSidePrice parameter:
+   * Coinbase WS ticker channel emits last_trade_price which can spike to fictive
+   * levels on thin orderbook altcoins. When a single trade consumes the asks up
+   * to a high level, last_trade reflects that price, but a market SELL would
+   * fill at the best_bid (significantly lower).
+   *
+   * For SELL decisions we MUST use best_bid because that's the actual price
+   * we'd touch on a market sell. Using last_trade caused massive slippage on
+   * pump1h trades (e.g. SUP partial-take "PnL=+48%" → real fill at -1.7%).
+   *
+   * Strategy:
+   *   - sellSidePrice (best_bid from WS ticker) drives pnlPct → fast-exit decisions
+   *   - currentPrice (last_trade) is kept for valueUSD display (matches what
+   *     people see on Coinbase price tickers)
+   *
+   * If sellSidePrice is null (rare — no bid in book), fall back to currentPrice.
    */
-  updatePriceForSymbol(symbol: string, currentPrice: number): AgentPosition | undefined {
+  updatePriceForSymbol(symbol: string, currentPrice: number, sellSidePrice?: number | null): AgentPosition | undefined {
     const pos = this.positions.get(symbol);
     if (!pos) return undefined;
     pos.currentPrice = currentPrice;
-    pos.pnlPct = ((currentPrice - pos.avgBuyPrice) / pos.avgBuyPrice) * 100;
-    pos.valueUSD = pos.units * currentPrice;
+    // Use sellSidePrice (best_bid) for PnL calc when available — that's the price
+    // we'd actually receive on a market SELL. Falls back to currentPrice (last_trade)
+    // if best_bid not provided (e.g. preload, or thin moments without bids).
+    const pnlPrice = sellSidePrice && sellSidePrice > 0 ? sellSidePrice : currentPrice;
+    pos.pnlPct = ((pnlPrice - pos.avgBuyPrice) / pos.avgBuyPrice) * 100;
+    pos.valueUSD = pos.units * pnlPrice;  // realistic exit value
     return pos;
   }
 
@@ -295,12 +308,6 @@ export class PositionsTracker {
           buyTimestamp: r.lastBuyTs ?? Date.now(),
           pnlPct: 0,
           valueUSD: r.valueUSD ?? (r.units * r.avgBuyPrice),
-          // PUMP-1H DETECTOR (2026-05-03) — Read dispatchSource from Vercel response.
-          // The Vercel /api/agent/positions endpoint returns this field per symbol
-          // when the position originates from a worker-pump1h dispatch. When
-          // undefined, fast-exit-evaluator falls back to standard sub-min thresholds
-          // (no behavioral change on early_pump positions).
-          dispatchSource: r.dispatchSource,
         });
       }
       return positionsMap;
@@ -338,13 +345,10 @@ export class PositionsTracker {
     const STALE_META_MAX_AGE_MS = 24 * 60 * 60 * 1000;
     const now = Date.now();
     const tradeMeta = (await redisGet<Record<string, TradeMetaEntry>>(TRADE_META_KEY)) ?? {};
-    const metaBySymbol = new Map<string, { avgBuyPrice: number; buyTimestamp: number; dispatchSource?: string }>();
+    const metaBySymbol = new Map<string, { avgBuyPrice: number; buyTimestamp: number }>();
     for (const orderId of Object.keys(tradeMeta)) {
       const meta = tradeMeta[orderId];
-      // PUMP-1H DETECTOR (2026-05-03) — Accept both "opportunity" (early_pump
-      // and classical alt_pump) AND "opportunity-pump1h" (sustained pump).
-      // Both types represent agent-managed BUYs that the worker should track.
-      if (!meta || (meta.type !== "opportunity" && meta.type !== "opportunity-pump1h")) continue;
+      if (!meta || meta.type !== "opportunity") continue;
       if (typeof meta.avgBuyPrice !== "number" || typeof meta.buyTimestamp !== "number" || !meta.symbol) continue;
       if ((now - meta.buyTimestamp) > STALE_META_MAX_AGE_MS) continue;
       const existing = metaBySymbol.get(meta.symbol);
@@ -352,7 +356,6 @@ export class PositionsTracker {
         metaBySymbol.set(meta.symbol, {
           avgBuyPrice: meta.avgBuyPrice,
           buyTimestamp: meta.buyTimestamp,
-          dispatchSource: meta.dispatchSource,
         });
       }
     }
@@ -372,7 +375,6 @@ export class PositionsTracker {
         buyTimestamp: meta.buyTimestamp,
         pnlPct: 0,
         valueUSD,
-        dispatchSource: meta.dispatchSource,  // PUMP-1H DETECTOR (2026-05-03)
       });
     }
     return newPositions;

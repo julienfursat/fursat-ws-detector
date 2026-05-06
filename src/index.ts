@@ -122,13 +122,18 @@ async function main(): Promise<void> {
   let totalTicks = 0;
   const onTick = (tick: Tick): void => {
     totalTicks++;
-    ringBuffers.updateTick(tick.symbol, tick.price, tick.volume24h, tick.timestamp);
+    // BACKLOG-3 phase 7 (2026-05-06) — store bestBid in ring buffer too,
+    // so detector.tryDispatchSlowDown can read it via snap.bestBid.
+    ringBuffers.updateTick(tick.symbol, tick.price, tick.volume24h, tick.timestamp, tick.bestBid);
     detector.evaluateTick(tick.symbol, tick.price, tick.volume24h);
-    fastExitEvaluator.evaluateTick(tick.symbol, tick.price);
+    // bestBid passed explicitly so fast-exit decisions use the actual SELL-side
+    // price, not last_trade which can spike to fictive levels on thin orderbook
+    // altcoins (root cause of pump1h slippage 05/05).
+    fastExitEvaluator.evaluateTick(tick.symbol, tick.price, tick.bestBid);
     void writeHeartbeat();
     if (totalTicks % TICK_DEBUG_SAMPLE_RATE === 0) {
       logger.debug("Tick sample", {
-        symbol: tick.symbol, price: tick.price, totalTicks,
+        symbol: tick.symbol, price: tick.price, bestBid: tick.bestBid, totalTicks,
       });
     }
   };
