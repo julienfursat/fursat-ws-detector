@@ -113,45 +113,31 @@ export async function writeHeartbeat(minIntervalMs = 30_000): Promise<boolean> {
   return true;
 }
 
-// ─── List operations (BACKLOG-3 phase 4 — 2026-05-03) ───
-// Used for high-throughput rolling logs (dryrun:detected_signals_log,
-// dryrun:fastpath_log, etc.) where the previous "GET → merge → SET" pattern
-// became prohibitively expensive at scale.
-//
-// Why LIST instead of JSON blob:
-//   • LPUSH is O(1) regardless of list size (vs O(N) re-serialize for SET)
-//   • LTRIM is O(M) where M = elements to drop, also O(1) amortized
-//   • Memory cost: Upstash bills per command, not per byte → cheaper at high write rates
-//   • A 50000-entry blob would re-serialize ~5 MB on every flush (every 5s) = expensive
-//
-// Pipeline strategy: we batch LPUSH with multiple values in one call (Upstash REST
-// accepts variadic LPUSH). Then a single LTRIM after. Total: 2 HTTP round-trips per flush.
+// ─────────────────────────────────────────────────────────────────────────────
+// Lot 2 — Hash + List helpers for shadow:* events storage (event-detector)
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Append one or more values to the LEFT of a Redis list (newest-first ordering).
- * Each value is JSON-serialized. Returns true on success.
+ * Push value(s) to the LEFT of a Redis list. Used for shadow:events_completed.
  */
-export async function redisLpush(key: string, values: unknown[]): Promise<boolean> {
+export async function redisLpush(key: string, value: unknown): Promise<void> {
   assertNotProtected(key);
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
-  if (values.length === 0) return true;
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
   try {
-    const cmd = ["LPUSH", key, ...values.map((v) => JSON.stringify(v))];
+    const payload = typeof value === "string" ? value : JSON.stringify(value);
     await fetch(UPSTASH_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify(cmd),
+      body: JSON.stringify(["LPUSH", key, payload]),
     });
-    return true;
   } catch (err) {
-    logger.warn("redisLpush failed", { key, count: values.length, err: (err as Error).message });
-    return false;
+    logger.warn("redisLpush failed", { key, err: (err as Error).message });
   }
 }
 
 /**
- * Trim a Redis list to keep only entries between [start, stop] (inclusive, 0-indexed).
- * To cap a left-pushed list to N most recent entries: redisLtrim(key, 0, N-1).
+ * Trim a Redis list to a maximum length (keep most recent entries).
+ * Use with redisLpush to maintain a rolling window.
  */
 export async function redisLtrim(key: string, start: number, stop: number): Promise<void> {
   assertNotProtected(key);
@@ -168,49 +154,61 @@ export async function redisLtrim(key: string, start: number, stop: number): Prom
 }
 
 /**
- * Read a range of entries from a Redis list. Each entry is JSON-parsed.
- * Use redisLrange(key, 0, -1) to read the whole list, or (key, 0, N-1) for the N newest.
+ * Set a single field in a Redis hash. Used for shadow:events_pending where
+ * eventId → JSON event payload.
  */
-export async function redisLrange<T = unknown>(key: string, start: number, stop: number): Promise<T[]> {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return [];
+export async function redisHset(key: string, field: string, value: unknown): Promise<void> {
+  assertNotProtected(key);
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
   try {
-    const res = await fetch(UPSTASH_URL, {
+    const payload = typeof value === "string" ? value : JSON.stringify(value);
+    await fetch(UPSTASH_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify(["LRANGE", key, String(start), String(stop)]),
+      body: JSON.stringify(["HSET", key, field, payload]),
     });
-    const data = (await res.json()) as { result?: string[] };
-    if (!Array.isArray(data.result)) return [];
-    const out: T[] = [];
-    for (const raw of data.result) {
-      try {
-        out.push(JSON.parse(raw) as T);
-      } catch {
-        // Skip malformed entries silently — defensive against partial corruption
-      }
-    }
-    return out;
   } catch (err) {
-    logger.warn("redisLrange failed", { key, err: (err as Error).message });
-    return [];
+    logger.warn("redisHset failed", { key, field, err: (err as Error).message });
   }
 }
 
 /**
- * Get the length of a Redis list. Returns 0 on any failure (no list / not a list / network).
+ * Read a single field from a Redis hash. Returns parsed JSON or null.
  */
-export async function redisLlen(key: string): Promise<number> {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return 0;
+export async function redisHget<T = unknown>(key: string, field: string): Promise<T | null> {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
   try {
     const res = await fetch(UPSTASH_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify(["LLEN", key]),
+      body: JSON.stringify(["HGET", key, field]),
     });
-    const data = (await res.json()) as { result?: number };
-    return typeof data.result === "number" ? data.result : 0;
+    const data = (await res.json()) as { result?: string };
+    if (data.result === undefined || data.result === null) return null;
+    try {
+      return JSON.parse(data.result) as T;
+    } catch {
+      return data.result as unknown as T;
+    }
   } catch (err) {
-    logger.warn("redisLlen failed", { key, err: (err as Error).message });
-    return 0;
+    logger.warn("redisHget failed", { key, field, err: (err as Error).message });
+    return null;
+  }
+}
+
+/**
+ * Delete a single field from a Redis hash.
+ */
+export async function redisHdel(key: string, field: string): Promise<void> {
+  assertNotProtected(key);
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  try {
+    await fetch(UPSTASH_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(["HDEL", key, field]),
+    });
+  } catch (err) {
+    logger.warn("redisHdel failed", { key, field, err: (err as Error).message });
   }
 }

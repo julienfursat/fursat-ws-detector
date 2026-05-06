@@ -34,6 +34,9 @@ import { preloadRingBuffers } from "./preload.js";
 import { PositionsTracker } from "./positions.js";
 import { PnlTracker } from "./pnl-tracker.js";
 import { FastExitEvaluator } from "./fast-exit-evaluator.js";
+// Lot 2 (2026-05-06) — Multi-strategy event detector (passive, shadow:* keys only)
+import { EventDetector } from "./event-detector.js";
+import { EventFollowup } from "./event-followup.js";
 
 const PORT = parseInt(process.env.PORT ?? "8080", 10);
 const PRODUCT_REFRESH_INTERVAL_MS = 60 * 60_000;
@@ -118,6 +121,12 @@ async function main(): Promise<void> {
   // 9. Fast-exit evaluator (real-time SELL on every tick of held assets)
   const fastExitEvaluator = new FastExitEvaluator(ringBuffers, positions, pnlTracker);
 
+  // 9b. Lot 2 (2026-05-06) — Passive multi-strategy event detector.
+  // Writes shadow:* events for retroactive simulation. Never triggers BUYs.
+  // Active during the 7-day observation week (07-12/05/2026).
+  const eventFollowup = new EventFollowup(ringBuffers);
+  const eventDetector = new EventDetector(ringBuffers, eventFollowup);
+
   // 10. Tick handler — feeds buffers, detector, AND fast-exit-evaluator
   let totalTicks = 0;
   const onTick = (tick: Tick): void => {
@@ -130,6 +139,8 @@ async function main(): Promise<void> {
     // price, not last_trade which can spike to fictive levels on thin orderbook
     // altcoins (root cause of pump1h slippage 05/05).
     fastExitEvaluator.evaluateTick(tick.symbol, tick.price, tick.bestBid);
+    // Lot 2 — multi-strategy event detection (passive, shadow:* writes only)
+    eventDetector.evaluateTick(tick.symbol);
     void writeHeartbeat();
     if (totalTicks % TICK_DEBUG_SAMPLE_RATE === 0) {
       logger.debug("Tick sample", {
@@ -156,6 +167,10 @@ async function main(): Promise<void> {
       positions: positions.stats(),
       pnlTracker: pnlTracker.stats(),
       fastExit: fastExitEvaluator.stats(),
+      eventDetector: {
+        counters: eventDetector.getCounters(),
+        pendingFollowups: eventFollowup.getPendingCount(),
+      },
     });
   }, STATS_LOG_INTERVAL_MS);
 
