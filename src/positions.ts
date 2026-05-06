@@ -43,7 +43,7 @@ const POLL_INTERVAL_MS = 5_000;
 // history). Timeout is conservative — Vercel typically responds in 200-800ms
 // (cache hit ~50ms, cache miss ~500-1000ms with Coinbase round-trips).
 // 5s gives margin for cold-start while keeping the 5s poll cadence honest.
-const VERCEL_POSITIONS_TIMEOUT_MS = 5_000;
+const VERCEL_POSITIONS_TIMEOUT_MS = 10_000;  // 10s — bumped from 5s to absorb cold-lambda starts (2026-05-06)
 
 // Symbols that are NEVER opportunity positions (BTC/ETH are core holdings)
 const MAJORS = new Set(["BTC", "ETH"]);
@@ -81,6 +81,9 @@ interface TradeMetaEntry {
   symbol?: string;
   avgBuyPrice?: number;
   buyTimestamp?: number;
+  // BACKLOG-3 phase 7+ (2026-05-06) — read dispatchSource from trade_meta so
+  // fallback path can propagate the routing info to detector exit thresholds.
+  dispatchSource?: string;
 }
 
 interface CoinbaseAccount {
@@ -314,6 +317,11 @@ export class PositionsTracker {
           buyTimestamp: r.lastBuyTs ?? Date.now(),
           pnlPct: 0,
           valueUSD: r.valueUSD ?? (r.units * r.avgBuyPrice),
+          // BACKLOG-3 phase 7+ (2026-05-06) — propagate dispatchSource if Vercel
+          // returns it. Required for detector to route pump1h-specific exit
+          // thresholds (FAST_TP_PUMP1H_PNL_PCT=15). If older Vercel doesn't
+          // return it, stays undefined → standard sub-min thresholds (legacy).
+          dispatchSource: r.dispatchSource,
         });
       }
       return positionsMap;
@@ -351,10 +359,16 @@ export class PositionsTracker {
     const STALE_META_MAX_AGE_MS = 24 * 60 * 60 * 1000;
     const now = Date.now();
     const tradeMeta = (await redisGet<Record<string, TradeMetaEntry>>(TRADE_META_KEY)) ?? {};
-    const metaBySymbol = new Map<string, { avgBuyPrice: number; buyTimestamp: number }>();
+    const metaBySymbol = new Map<string, { avgBuyPrice: number; buyTimestamp: number; dispatchSource?: string }>();
     for (const orderId of Object.keys(tradeMeta)) {
       const meta = tradeMeta[orderId];
-      if (!meta || meta.type !== "opportunity") continue;
+      // BACKLOG-3 phase 7+ (2026-05-06) — Accept both "opportunity" AND
+      // "opportunity-pump1h". Previously this filter only accepted "opportunity",
+      // which silently DROPPED pump1h positions in the trade_meta fallback path.
+      // When Vercel /api/agent/positions was unavailable (which happens often),
+      // pump1h positions disappeared from the worker's position map. Discovered
+      // 2026-05-06 when Vercel was down for hours and pump1h trades were misrouted.
+      if (!meta || (meta.type !== "opportunity" && meta.type !== "opportunity-pump1h")) continue;
       if (typeof meta.avgBuyPrice !== "number" || typeof meta.buyTimestamp !== "number" || !meta.symbol) continue;
       if ((now - meta.buyTimestamp) > STALE_META_MAX_AGE_MS) continue;
       const existing = metaBySymbol.get(meta.symbol);
@@ -362,6 +376,7 @@ export class PositionsTracker {
         metaBySymbol.set(meta.symbol, {
           avgBuyPrice: meta.avgBuyPrice,
           buyTimestamp: meta.buyTimestamp,
+          dispatchSource: meta.dispatchSource,
         });
       }
     }
@@ -381,6 +396,7 @@ export class PositionsTracker {
         buyTimestamp: meta.buyTimestamp,
         pnlPct: 0,
         valueUSD,
+        dispatchSource: meta.dispatchSource,
       });
     }
     return newPositions;

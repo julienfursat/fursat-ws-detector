@@ -1225,7 +1225,19 @@ export class Detector {
 
     logger.info("⚡ SLOW-DOWN TRIGGER", {
       symbol, reasonCode: verdict.reasonCode, detail: verdict.detail,
-      pnl: pnlPct.toFixed(2), price: snap.currentPrice,
+      pnl: pnlPct.toFixed(2),
+      price: snap.currentPrice,
+      // BACKLOG-3 phase 7+ (2026-05-06) — FULL DIAGNOSTIC for slippage debugging.
+      // We've seen pump1h fast_tp logs claiming "PnL=44%" while bestBid was $0.193 (BUY price).
+      // Root cause hypothesis: tick.bestBid spikes WITH last_trade on thin altcoins.
+      // These extra fields let us verify the hypothesis on the next occurrence.
+      bestBid: snap.bestBid,
+      avgBuyPrice: avgBuyPrice.toFixed(6),
+      pnlPctFromBestBid: snap.bestBid && snap.bestBid > 0
+        ? (((snap.bestBid - avgBuyPrice) / avgBuyPrice) * 100).toFixed(2)
+        : "n/a",
+      pnlPctFromCurrentPrice: (((snap.currentPrice - avgBuyPrice) / avgBuyPrice) * 100).toFixed(2),
+      dispatchSource: dispatchSource ?? "n/a",
     });
 
     // Tier 2: Redis cooldown check (10min, shared with scan.ts and fast-exit-evaluator)
