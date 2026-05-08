@@ -50,27 +50,7 @@ async function main(): Promise<void> {
     logLevel: process.env.LOG_LEVEL ?? "info",
   });
 
-  // 1. Discover products
-  const discovered = await fetchTradableSymbols();
-  const symbols = applySymbolOverride(discovered);
-  if (symbols.size === 0) {
-    logger.error("No symbols to subscribe — aborting");
-    process.exit(1);
-  }
-  const productIds = [...symbols].map(s => `${s}-USDC`);
-
-  // 2. Coinbase credentials
-  const apiKey = process.env.COINBASE_API_KEY ?? "";
-  const apiSecret = process.env.COINBASE_API_SECRET ?? "";
-  if (!apiKey || !apiSecret) {
-    logger.error("Coinbase credentials missing — aborting", {
-      hasKey: !!apiKey, hasSecret: !!apiSecret,
-    });
-    process.exit(1);
-  }
-
-  // 3. Start HTTP health server EARLY (before any potentially slow init).
-  // Railway healthcheck has a 30s window — we need /health to respond ASAP.
+  // 1. Start HTTP health server FIRST — Railway healthcheck has a 30s window.
   // Initial health responses will say "starting" until WS is connected.
   let healthSnapshot: () => any = () => ({
     connected: false,
@@ -86,7 +66,37 @@ async function main(): Promise<void> {
     stats: () => healthSnapshot(),
   };
   const httpServer = startHealthServer(PORT, healthProvider);
-  logger.info("HTTP health server started early — initialization continues in background");
+  logger.info("HTTP health server started — initialization continues in background");
+
+  // 2. Discover products (with retries for transient Coinbase API issues)
+  const MAX_SYMBOL_RETRIES = 5;
+  const SYMBOL_RETRY_DELAY_MS = 5_000;
+  let discovered = new Set<string>();
+  for (let attempt = 1; attempt <= MAX_SYMBOL_RETRIES; attempt++) {
+    discovered = await fetchTradableSymbols();
+    if (discovered.size > 0) break;
+    if (attempt < MAX_SYMBOL_RETRIES) {
+      logger.warn(`No tradable symbols found (attempt ${attempt}/${MAX_SYMBOL_RETRIES}) — retrying in ${SYMBOL_RETRY_DELAY_MS / 1000}s`);
+      await new Promise(r => setTimeout(r, SYMBOL_RETRY_DELAY_MS));
+    }
+  }
+  const symbols = applySymbolOverride(discovered);
+  if (symbols.size === 0) {
+    logger.error("No symbols to subscribe after all retries — aborting");
+    httpServer.close();
+    process.exit(1);
+  }
+  const productIds = [...symbols].map(s => `${s}-USDC`);
+
+  // 3. Coinbase credentials
+  const apiKey = process.env.COINBASE_API_KEY ?? "";
+  const apiSecret = process.env.COINBASE_API_SECRET ?? "";
+  if (!apiKey || !apiSecret) {
+    logger.error("Coinbase credentials missing — aborting", {
+      hasKey: !!apiKey, hasSecret: !!apiSecret,
+    });
+    process.exit(1);
+  }
 
   // 4. Ring buffers
   const ringBuffers = new RingBuffers();
