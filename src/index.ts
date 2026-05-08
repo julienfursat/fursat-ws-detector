@@ -43,6 +43,44 @@ const PRODUCT_REFRESH_INTERVAL_MS = 60 * 60_000;
 const STATS_LOG_INTERVAL_MS = 5 * 60_000;
 const TICK_DEBUG_SAMPLE_RATE = 50_000;
 
+// 2026-05-08 — Resilience helpers for Coinbase Public Products API
+// Background: on 2026-05-08 06:41-07:41 UTC the public products endpoint
+// degraded from ~230 products to 0, causing every Railway boot to exit(1)
+// before health server start (boot loop). Now we retry with exponential
+// backoff and only exit if persistently empty after several attempts.
+const PRODUCTS_FETCH_INITIAL_DELAY_MS = 2_000;
+const PRODUCTS_FETCH_MAX_DELAY_MS = 60_000;
+const PRODUCTS_FETCH_MAX_ATTEMPTS = 8;  // ~2 min total with backoff
+
+async function fetchTradableSymbolsWithRetry(): Promise<Set<string>> {
+  let delay = PRODUCTS_FETCH_INITIAL_DELAY_MS;
+  for (let attempt = 1; attempt <= PRODUCTS_FETCH_MAX_ATTEMPTS; attempt++) {
+    try {
+      const discovered = await fetchTradableSymbols();
+      if (discovered.size > 0) {
+        if (attempt > 1) {
+          logger.info("Coinbase products API recovered", {
+            attempt, count: discovered.size,
+          });
+        }
+        return discovered;
+      }
+      logger.warn("Coinbase products API returned 0 products, retrying", {
+        attempt, nextDelayMs: delay,
+      });
+    } catch (err) {
+      logger.warn("Coinbase products API throw, retrying", {
+        attempt, nextDelayMs: delay, err: (err as Error).message,
+      });
+    }
+    if (attempt < PRODUCTS_FETCH_MAX_ATTEMPTS) {
+      await new Promise((res) => setTimeout(res, delay));
+      delay = Math.min(delay * 2, PRODUCTS_FETCH_MAX_DELAY_MS);
+    }
+  }
+  return new Set();  // caller decides what to do
+}
+
 async function main(): Promise<void> {
   logger.info("Starting fursat-ws-detector (étape 2C — BUY entry + fast-exit SELL)", {
     nodeVersion: process.version,
@@ -50,27 +88,10 @@ async function main(): Promise<void> {
     logLevel: process.env.LOG_LEVEL ?? "info",
   });
 
-  // 1. Discover products
-  const discovered = await fetchTradableSymbols();
-  const symbols = applySymbolOverride(discovered);
-  if (symbols.size === 0) {
-    logger.error("No symbols to subscribe — aborting");
-    process.exit(1);
-  }
-  const productIds = [...symbols].map(s => `${s}-USDC`);
-
-  // 2. Coinbase credentials
-  const apiKey = process.env.COINBASE_API_KEY ?? "";
-  const apiSecret = process.env.COINBASE_API_SECRET ?? "";
-  if (!apiKey || !apiSecret) {
-    logger.error("Coinbase credentials missing — aborting", {
-      hasKey: !!apiKey, hasSecret: !!apiSecret,
-    });
-    process.exit(1);
-  }
-
-  // 3. Start HTTP health server EARLY (before any potentially slow init).
+  // 1. Start HTTP health server FIRST (before any potentially slow init).
   // Railway healthcheck has a 30s window — we need /health to respond ASAP.
+  // 2026-05-08 — moved before fetchTradableSymbols so that a Coinbase API
+  // outage doesn't cause boot loops (cf. 06:41-07:41 UTC incident).
   // Initial health responses will say "starting" until WS is connected.
   let healthSnapshot: () => any = () => ({
     connected: false,
@@ -87,6 +108,28 @@ async function main(): Promise<void> {
   };
   const httpServer = startHealthServer(PORT, healthProvider);
   logger.info("HTTP health server started early — initialization continues in background");
+
+  // 2. Verify Coinbase credentials early (cheap, no network call)
+  const apiKey = process.env.COINBASE_API_KEY ?? "";
+  const apiSecret = process.env.COINBASE_API_SECRET ?? "";
+  if (!apiKey || !apiSecret) {
+    logger.error("Coinbase credentials missing — aborting", {
+      hasKey: !!apiKey, hasSecret: !!apiSecret,
+    });
+    process.exit(1);
+  }
+
+  // 3. Discover products (with retry — see fetchTradableSymbolsWithRetry).
+  // If still empty after retries, exit(1) so Railway restarts later when
+  // Coinbase has recovered. Health server is already up so Railway saw
+  // healthy status and won't crash-loop us tightly.
+  const discovered = await fetchTradableSymbolsWithRetry();
+  const symbols = applySymbolOverride(discovered);
+  if (symbols.size === 0) {
+    logger.error("No symbols to subscribe after retries — aborting (Railway will restart)");
+    process.exit(1);
+  }
+  const productIds = [...symbols].map(s => `${s}-USDC`);
 
   // 4. Ring buffers
   const ringBuffers = new RingBuffers();
