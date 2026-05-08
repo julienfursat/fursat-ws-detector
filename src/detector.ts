@@ -67,13 +67,6 @@ const WORKER_PUMP1H_HOURLY_COUNTER_KEY = "worker:hourly_pump1h_count";
 const WORKER_PUMP1H_DISPATCHED_KEY_PREFIX = "worker:dispatched:pump1h:";  // + symbol
 const WORKER_PUMP1H_HOURLY_CAP = 5;
 const WORKER_PUMP1H_THROTTLE_MS = 60 * 60 * 1000;  // 60min per-asset
-
-// PASSIVE OBSERVATION MODE (BACKLOG-3 phase 8 — 2026-05-06)
-// Killswitch for early_pump dispatches (sub-minute fast-path BUYs). When false,
-// the detector still EVALUATES the rule (and logs to dryrun:early_dispatch_log
-// for retroactive analysis) but does NOT call dispatchEntry.
-// Defaults to true (existing behavior) — set to false in passive observation week.
-const WORKER_EARLY_PUMP_BUY_ENABLED = (process.env.WORKER_EARLY_PUMP_BUY_ENABLED ?? "true").toLowerCase() === "true";
 import {
   classifySignal,
   evaluateFastPathCandidate,
@@ -589,7 +582,11 @@ export class Detector {
         // Optional: log near-miss early evaluations for calibration. Only log when
         // sub-minute data is present and at least one threshold was close, otherwise
         // we'd flood the log on every routine tick.
-        if (snap.change30s !== null && snap.change30s >= 0.5) {
+        // 2026-05-08 — also skip corrupt_* reasons (Coinbase volume24h glitches like
+        // B3 reporting 15.3B): they're external data noise, not calibration signals,
+        // and they fire on EVERY tick which floods the buffer.
+        if (snap.change30s !== null && snap.change30s >= 0.5
+            && !earlyVerdict.reason.startsWith("corrupt_")) {
           this.recordEarlyDispatch(now, input, earlyVerdict.isEarly, earlyVerdict.reason, false, "not_triggered");
         }
       }
@@ -647,7 +644,12 @@ export class Detector {
         // Optional: log near-miss pump-1h evaluations for calibration. Only log
         // when change1h is meaningful (≥5%) to avoid flooding the log with
         // routine ticks that are nowhere near triggering.
-        if (snap.change1h !== null && snap.change1h >= 5) {
+        // 2026-05-08 — also skip corrupt_* reasons (Coinbase volume24h glitches like
+        // B3 reporting 15.3B): they're external data noise, not calibration signals,
+        // and they fire on EVERY tick (~5 logs/sec on B3) which inflated the
+        // pump1h_dispatch_log to 105 MB and triggered Upstash 100MB record limit.
+        if (snap.change1h !== null && snap.change1h >= 5
+            && !pump1hVerdict.reason.startsWith("corrupt_")) {
           this.recordPump1hDispatch(now, input, false, pump1hVerdict.reason, false, "not_triggered");
         }
       }
@@ -889,17 +891,6 @@ export class Detector {
         this.recordEarlyDispatch(now, this.candidateToInput(c), true, earlyReason, false, `blacklist:${blacklistCheck.reason}`);
         logger.info("Early dispatch SKIPPED — blacklisted", {
           symbol, reason: blacklistCheck.reason,
-        });
-        return;
-      }
-
-      // PASSIVE OBSERVATION MODE (BACKLOG-3 phase 8 — 2026-05-06)
-      // When killswitch is off, log the would-be dispatch but skip the actual call.
-      // Pre-checks above (throttle, blacklist) still run so the data is comparable.
-      if (!WORKER_EARLY_PUMP_BUY_ENABLED) {
-        this.recordEarlyDispatch(now, this.candidateToInput(c), true, earlyReason, false, "killswitch_disabled");
-        logger.info("Early dispatch SKIPPED — killswitch off (passive mode)", {
-          symbol, change30s: c.change30s, change5m: c.change5m, change1h: c.change1h,
         });
         return;
       }
