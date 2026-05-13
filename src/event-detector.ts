@@ -28,6 +28,9 @@ import { logger } from "./logger.js";
 import { redisHset } from "./redis.js";
 import type { RingBuffers, PriceSnapshot } from "./ring-buffers.js";
 import { EventFollowup } from "./event-followup.js";
+// 2026-05-13 — Stratégie V3 : dispatcher optionnel pour les events stair_step.
+// Injecté via setStairstepDispatcher() pour rester optional dependency.
+import type { StairstepDispatcher } from "./stairstep-dispatcher.js";
 
 // Event kinds & detection rules
 
@@ -121,6 +124,12 @@ export class EventDetector {
   // Stair-step state: symbol → last peak observation
   private stairStepState = new Map<string, StairStepState>();
 
+  // 2026-05-13 — Optional dispatcher V3 (injected via setStairstepDispatcher).
+  // When set, every stair_step event that fires (passive shadow recording)
+  // also triggers a real BUY dispatch attempt (the dispatcher itself applies
+  // V3 filters + killswitch + Vercel cap before any actual order).
+  private stairstepDispatcher: StairstepDispatcher | null = null;
+
   // Counters for diagnostics
   private counters: Record<EventKind, number> = {
     early_explosive: 0,
@@ -135,6 +144,17 @@ export class EventDetector {
   constructor(ringBuffers: RingBuffers, followup: EventFollowup) {
     this.ringBuffers = ringBuffers;
     this.followup = followup;
+  }
+
+  /**
+   * 2026-05-13 — Wiring V3 : injection optionnelle du dispatcher V3.
+   * Si appelé après construction, chaque event stair_step déclenchera (en
+   * fire-and-forget) une tentative de dispatch via le dispatcher. La logique
+   * shadow continue inchangée (Redis hset + followup scheduling).
+   */
+  setStairstepDispatcher(dispatcher: StairstepDispatcher): void {
+    this.stairstepDispatcher = dispatcher;
+    logger.info("[event-detector] StairstepDispatcher wired");
   }
 
   /**
@@ -397,6 +417,14 @@ export class EventDetector {
 
     // Schedule followups (in-memory timers)
     this.followup.schedule(event);
+
+    // 2026-05-13 — Hook V3 : pour les events stair_step, tenter un dispatch
+    // BUY réel via le dispatcher injecté. Fire-and-forget : on ne bloque pas
+    // la suite (shadow + followups continuent normalement).
+    // Le dispatcher applique lui-même tous les filtres V3 + killswitch.
+    if (kind === "stair_step" && this.stairstepDispatcher) {
+      this.stairstepDispatcher.tryDispatch(event);
+    }
   }
 
   /**

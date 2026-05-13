@@ -37,6 +37,9 @@ import { FastExitEvaluator } from "./fast-exit-evaluator.js";
 // Lot 2 (2026-05-06) — Multi-strategy event detector (passive, shadow:* keys only)
 import { EventDetector } from "./event-detector.js";
 import { EventFollowup } from "./event-followup.js";
+// Lot 3 V3 (2026-05-13) — Dispatcher V3 pour la stratégie stair_step trailing.
+// Tourne en parallèle du shadow recording, applique filtres V3 et dispatch BUY.
+import { StairstepDispatcher } from "./stairstep-dispatcher.js";
 
 const PORT = parseInt(process.env.PORT ?? "8080", 10);
 const PRODUCT_REFRESH_INTERVAL_MS = 60 * 60_000;
@@ -170,6 +173,14 @@ async function main(): Promise<void> {
   const eventFollowup = new EventFollowup(ringBuffers);
   const eventDetector = new EventDetector(ringBuffers, eventFollowup);
 
+  // 9c. Lot 3 V3 (2026-05-13) — Stairstep V3 dispatcher.
+  // Wires into eventDetector so that every stair_step event triggers a BUY
+  // dispatch attempt (after V3 filters, killswitch, Vercel cap). When
+  // WORKER_STAIRSTEP_BUY_ENABLED=false (default), all attempts are skipped
+  // locally → zero impact on Vercel. Flip the env var to true to go live.
+  const stairstepDispatcher = new StairstepDispatcher();
+  eventDetector.setStairstepDispatcher(stairstepDispatcher);
+
   // 10. Tick handler — feeds buffers, detector, AND fast-exit-evaluator
   let totalTicks = 0;
   const onTick = (tick: Tick): void => {
@@ -214,6 +225,8 @@ async function main(): Promise<void> {
         counters: eventDetector.getCounters(),
         pendingFollowups: eventFollowup.getPendingCount(),
       },
+      // Lot 3 V3 (2026-05-13)
+      stairstepDispatcher: stairstepDispatcher.getStats(),
     });
   }, STATS_LOG_INTERVAL_MS);
 
