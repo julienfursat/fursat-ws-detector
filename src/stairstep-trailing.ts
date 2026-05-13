@@ -68,6 +68,16 @@ const PEAK_DELTA_FOR_INSTANT_PERSIST = 0.5;  // si peak boost ≥ +0.5pp → per
 // Reconciliation Coinbase
 const RECONCILE_INTERVAL_MS = 60_000;
 
+// V3 (2026-05-13 hotfix) — Grace period anti-drop précoce.
+// Bug d'origine : BNKR 16:52:10 BUY OK → 16:52:15 reconcile drop (Coinbase pas
+// encore polled), 16:52:24 Positions refreshed confirme BNKR détenue → trop tard,
+// déjà drop. Statistiquement ~50% des nouvelles positions étaient liquidées
+// silencieusement du tracker dans la fenêtre [BUY, prochain poll Vercel].
+// Solution : ne JAMAIS drop une position de moins de 90s (couvre poll 30s +
+// confirmation Coinbase + marge). Au pire on garde une position fantôme 90s
+// en RAM si elle a vraiment été annulée ailleurs — négligeable.
+const RECONCILE_GRACE_MS = 90_000;
+
 // Dispatch SELL
 const FURSAT_API_BASE = (process.env.FURSAT_API_BASE ?? "https://www.fursat.net").replace(/\/$/, "");
 const SELL_URL = `${FURSAT_API_BASE}/api/agent/sell-stairstep`;
@@ -117,6 +127,7 @@ export class StairstepTrailing {
       stairstep_timeout_no_peak: 0,
     } as Record<ExitReason, number>,
     reconcileDropped: 0,    // positions droppées car Coinbase n'a plus la balance
+    reconcileGraced: 0,     // V3 hotfix : positions épargnées par grace period (jeunes < 90s)
     reloadFromRedis: 0,
   };
 
@@ -451,18 +462,35 @@ export class StairstepTrailing {
     if (this.positions.size === 0) return;
     try {
       const heldSymbols = this.positionsTracker.getHeldSymbols();
+      const now = Date.now();
       for (const [sym, pos] of [...this.positions.entries()]) {
-        if (!heldSymbols.has(sym)) {
-          logger.warn("[stairstep-trailing] reconcile: position no longer in Coinbase, dropping", {
+        if (heldSymbols.has(sym)) continue;
+
+        // V3 (2026-05-13 hotfix) — Grace period anti-drop précoce.
+        // Une position fraîchement créée peut ne pas encore apparaître dans
+        // heldSymbols (cache positions Vercel toutes les 30s vs BUY < 30s).
+        // Cf. bug BNKR 16:52:10 → drop à 16:52:15 → confirmé Coinbase à 16:52:24.
+        const ageMs = now - pos.buyTimestamp;
+        if (ageMs < RECONCILE_GRACE_MS) {
+          this.stats_.reconcileGraced++;
+          logger.info("[stairstep-trailing] reconcile: skipping young position (grace period)", {
             symbol: sym,
-            avgBuyPrice: pos.avgBuyPrice,
+            ageSeconds: (ageMs / 1000).toFixed(1),
+            graceSeconds: (RECONCILE_GRACE_MS / 1000).toFixed(0),
             currentPnl: pos.currentPnlPct.toFixed(2),
-            heldMinutes: ((Date.now() - pos.buyTimestamp) / 60_000).toFixed(1),
           });
-          this.positions.delete(sym);
-          this.stats_.reconcileDropped++;
-          await this.deletePersistedPosition(sym);
+          continue;
         }
+
+        logger.warn("[stairstep-trailing] reconcile: position no longer in Coinbase, dropping", {
+          symbol: sym,
+          avgBuyPrice: pos.avgBuyPrice,
+          currentPnl: pos.currentPnlPct.toFixed(2),
+          heldMinutes: ((Date.now() - pos.buyTimestamp) / 60_000).toFixed(1),
+        });
+        this.positions.delete(sym);
+        this.stats_.reconcileDropped++;
+        await this.deletePersistedPosition(sym);
       }
     } catch (err) {
       logger.warn("[stairstep-trailing] reconcile threw", {
