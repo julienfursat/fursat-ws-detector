@@ -131,6 +131,33 @@ async function recordFastExitDispatch(symbol: string): Promise<void> {
  */
 export async function dispatchFastExit(payload: FastExitDispatchPayload): Promise<FastExitDispatchResult> {
   const startedAt = Date.now();
+
+  // ─── V3 CLEANING (2026-05-13) ────────────────────────────────────────────
+  // V3 utilise stairstep-trailing pour les SELL. Le legacy fast-exit ne doit
+  // PLUS être appelé pour éviter de SELL des positions V3 (cf. bug
+  // BILL/UP/BNKR du 13/05 19:46).
+  //
+  // On garde le code legacy fonctionnel mais neutralisé : detector continue à
+  // logguer "SLOW-DOWN TRIGGER" (shadow data analytique), mais aucun SELL
+  // n'est jamais POST vers Vercel.
+  //
+  // Pour revenir au legacy si V3 désactivé : WORKER_LEGACY_FAST_EXIT_ENABLED=true.
+  const LEGACY_FAST_EXIT_ENABLED = (process.env.WORKER_LEGACY_FAST_EXIT_ENABLED ?? "false").toLowerCase() === "true";
+  if (!LEGACY_FAST_EXIT_ENABLED) {
+    logger.info("[fast-exit-dispatcher] legacy dispatch skipped (V3 mode)", {
+      symbol: payload.symbol,
+      reasonCode: payload.reasonCode,
+      pnlPct: payload.pnlPct?.toFixed(2) ?? "?",
+    });
+    const result: FastExitDispatchResult = {
+      ok: false, status: null, responseBody: null,
+      cooldownSkipped: false, error: "legacy_fast_exit_disabled_v3",
+      durationMs: Date.now() - startedAt,
+    };
+    await appendFastExitLog(buildLogEntry(payload, result));
+    return result;
+  }
+
   const cronSecret = process.env.CRON_SECRET ?? process.env.CRYPTO_AGENT_SECRET ?? "";
   if (!cronSecret) {
     const err = "CRON_SECRET (or CRYPTO_AGENT_SECRET) missing — cannot dispatch fast-exit";

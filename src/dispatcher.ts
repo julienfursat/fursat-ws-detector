@@ -105,6 +105,36 @@ interface DispatchLogEntry {
  */
 export async function dispatchEntry(signal: DispatchSignal): Promise<DispatchResult> {
   const startedAt = Date.now();
+
+  // ─── V3 CLEANING (2026-05-13) ────────────────────────────────────────────
+  // Stratégie V3 = unique stratégie de production. Les détections legacy
+  // (alt_pump, early_pump, pump1h) restent actives pour le shadow data analytique
+  // (logs SIGNAL DETECTED, EARLY DISPATCH candidate, PUMP-1H DISPATCH candidate),
+  // mais NE doivent PLUS dispatcher de BUY. Le V3 utilise stairstep-dispatcher.
+  //
+  // Bug d'origine 2026-05-13 19:46 : `tryDispatchSlowDown` du detector a SELL
+  // des positions V3 via fast-exit (cf. logs BILL/UP/BNKR), parce que le
+  // dispatch legacy était toujours actif. Cleaning chirurgical : on coupe à la
+  // source, le detector continue à logguer mais aucun HTTP n'est jamais envoyé.
+  //
+  // Si jamais V3 est désactivé et qu'il faut revenir au legacy : remettre
+  // l'env var WORKER_LEGACY_DISPATCH_ENABLED=true.
+  const LEGACY_DISPATCH_ENABLED = (process.env.WORKER_LEGACY_DISPATCH_ENABLED ?? "false").toLowerCase() === "true";
+  if (!LEGACY_DISPATCH_ENABLED) {
+    logger.info("[dispatcher] legacy dispatchEntry skipped (V3 mode)", {
+      symbol: signal.symbol,
+      signalType: signal.signalType,
+      severity: signal.severity,
+    });
+    const result: DispatchResult = {
+      ok: false, status: null, responseBody: null,
+      skipped: true, skipReason: "legacy_dispatch_disabled_v3", throttleReleased: false,
+      error: null, durationMs: Date.now() - startedAt,
+    };
+    await appendDispatchLog(buildLogEntry(signal, result));
+    return result;
+  }
+
   const cronSecret = process.env.CRON_SECRET ?? process.env.CRYPTO_AGENT_SECRET ?? "";
   if (!cronSecret) {
     const err = "CRON_SECRET (or CRYPTO_AGENT_SECRET) missing — cannot dispatch";
