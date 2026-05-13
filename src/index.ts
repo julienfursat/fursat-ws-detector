@@ -40,6 +40,8 @@ import { EventFollowup } from "./event-followup.js";
 // Lot 3 V3 (2026-05-13) — Dispatcher V3 pour la stratégie stair_step trailing.
 // Tourne en parallèle du shadow recording, applique filtres V3 et dispatch BUY.
 import { StairstepDispatcher } from "./stairstep-dispatcher.js";
+// Lot 3 V3 (2026-05-13) — Gestion des positions ouvertes + trailing stop.
+import { StairstepTrailing } from "./stairstep-trailing.js";
 
 const PORT = parseInt(process.env.PORT ?? "8080", 10);
 const PRODUCT_REFRESH_INTERVAL_MS = 60 * 60_000;
@@ -173,12 +175,24 @@ async function main(): Promise<void> {
   const eventFollowup = new EventFollowup(ringBuffers);
   const eventDetector = new EventDetector(ringBuffers, eventFollowup);
 
-  // 9c. Lot 3 V3 (2026-05-13) — Stairstep V3 dispatcher.
+  // 9c. Lot 3 V3 (2026-05-13) — Stairstep V3 dispatcher + trailing.
   // Wires into eventDetector so that every stair_step event triggers a BUY
   // dispatch attempt (after V3 filters, killswitch, Vercel cap). When
   // WORKER_STAIRSTEP_BUY_ENABLED=false (default), all attempts are skipped
   // locally → zero impact on Vercel. Flip the env var to true to go live.
+  //
+  // Le trailing manager (StairstepTrailing) gère les positions ouvertes :
+  //   - Reload depuis Redis au boot (resilience aux restarts)
+  //   - Tracking peak/trough tick par tick
+  //   - Trigger SELL via /api/agent/sell-stairstep selon 3 conditions:
+  //     hard SL (-8%), trailing (peak retraced 1pt), timeout (2h no peak)
+  //   - Reconcile Coinbase toutes les 60s (drop positions vendues ailleurs)
+  const stairstepTrailing = new StairstepTrailing(positions);
+  await stairstepTrailing.loadFromRedis();
+  stairstepTrailing.start();
+
   const stairstepDispatcher = new StairstepDispatcher();
+  stairstepDispatcher.setTrailing(stairstepTrailing);
   eventDetector.setStairstepDispatcher(stairstepDispatcher);
 
   // 10. Tick handler — feeds buffers, detector, AND fast-exit-evaluator
@@ -195,6 +209,9 @@ async function main(): Promise<void> {
     fastExitEvaluator.evaluateTick(tick.symbol, tick.price, tick.bestBid);
     // Lot 2 — multi-strategy event detection (passive, shadow:* writes only)
     eventDetector.evaluateTick(tick.symbol);
+    // Lot 3 V3 (2026-05-13) — Trailing stop pour positions stair_step ouvertes.
+    // Fast path : si symbol pas tracké (99.9% des cas), retour immédiat.
+    stairstepTrailing.evaluateTick(tick.symbol, tick.price, tick.bestBid);
     void writeHeartbeat();
     if (totalTicks % TICK_DEBUG_SAMPLE_RATE === 0) {
       logger.debug("Tick sample", {
@@ -227,6 +244,7 @@ async function main(): Promise<void> {
       },
       // Lot 3 V3 (2026-05-13)
       stairstepDispatcher: stairstepDispatcher.getStats(),
+      stairstepTrailing: stairstepTrailing.getStats(),
     });
   }, STATS_LOG_INTERVAL_MS);
 
@@ -259,6 +277,7 @@ async function main(): Promise<void> {
     positions.stop();
     ringBuffers.stop();
     stream.stop();
+    stairstepTrailing.stop();  // 2026-05-13 — stop reconcile timer
     httpServer.close();
     setTimeout(() => process.exit(0), 1_500);
   };

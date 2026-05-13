@@ -25,6 +25,10 @@
 import { logger } from "./logger.js";
 import { redisGet, redisLpush, redisLtrim } from "./redis.js";
 import type { ShadowEvent } from "./event-detector.js";
+// 2026-05-13 — Injection circulaire (light) du trailing manager pour wiring
+// addPosition() après BUY confirmé. Utilise type-only import + setter pour
+// éviter le problème de boot order.
+import type { StairstepTrailing } from "./stairstep-trailing.js";
 
 const FURSAT_API_BASE = (process.env.FURSAT_API_BASE ?? "https://www.fursat.net").replace(/\/$/, "");
 const ENTRY_URL = `${FURSAT_API_BASE}/api/agent/entry`;
@@ -81,6 +85,11 @@ export class StairstepDispatcher {
   // Inflight guard — interdit deux dispatch concurrents pour le même symbol
   private inflight = new Set<string>();
 
+  // 2026-05-13 — Wiring V3 : trailing manager injecté via setTrailing.
+  // Quand un BUY est confirmé Vercel, on appelle trailing.addPosition pour
+  // démarrer le suivi peak/trough.
+  private trailing: StairstepTrailing | null = null;
+
   // Stats
   private stats_ = {
     dispatchesAttempted: 0,
@@ -106,6 +115,15 @@ export class StairstepDispatcher {
     // Guard : on ne traite que les stair_step
     if (event.kind !== "stair_step") return;
     void this.tryDispatchAsync(event);
+  }
+
+  /**
+   * 2026-05-13 — Wiring du trailing manager. Appelé une fois au boot
+   * par index.ts juste après instantiation.
+   */
+  setTrailing(trailing: StairstepTrailing): void {
+    this.trailing = trailing;
+    logger.info("[stairstep-dispatcher] StairstepTrailing wired");
   }
 
   private async tryDispatchAsync(event: ShadowEvent): Promise<void> {
@@ -254,6 +272,21 @@ export class StairstepDispatcher {
           slippageEntryPct: vercelBody?.slippageEntryPct,
           dailyCount: vercelBody?.dailyCount,
         });
+        // 2026-05-13 — Démarrer le suivi trailing immédiatement après BUY OK.
+        // Si trailing n'est pas wired (cas dégradé), on logue un warning car
+        // la position serait orpheline.
+        if (this.trailing) {
+          await this.trailing.addPosition({
+            symbol,
+            buyOrderId: vercelBody?.orderId ?? "unknown",
+            avgBuyPrice: vercelBody?.avgBuyPrice ?? snap.price,
+            sizingUsdc: vercelBody?.sizingUsdc ?? 50,
+          });
+        } else {
+          logger.error("[stairstep-dispatcher] BUY OK but trailing not wired — position will be orphaned!", {
+            symbol, orderId: vercelBody?.orderId,
+          });
+        }
       } else if (skipped) {
         this.stats_.vercelSkips++;
         logger.info("[stairstep-dispatcher] Vercel skipped", { symbol, reason });
