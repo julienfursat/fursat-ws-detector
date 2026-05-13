@@ -33,7 +33,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { logger } from "./logger.js";
-import { redisGet, redisSet, redisLpush, redisLtrim } from "./redis.js";
+import { redisLpush, redisLtrim } from "./redis.js";
 import type { PositionsTracker } from "./positions.js";
 
 // ─── Env config (override possible via Railway env vars) ────────────────────
