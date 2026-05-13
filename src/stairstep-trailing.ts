@@ -551,6 +551,17 @@ export class StairstepTrailing {
   }
 
   /**
+   * V3 (2026-05-13) — Indique si le trailing track une position ouverte sur ce symbol.
+   * Utilisé par stairstep-dispatcher pour bloquer les BUY doublons (anti-DCA).
+   * Bug d'origine 2026-05-13 ~19:13 : 2× BUY MATH consécutifs sans SELL entre les deux,
+   * car le dispatcher ne vérifiait pas si une position existait déjà. La 2e position
+   * écrasait la 1ère dans le tracking → peak perdu, PnL calculé sur la 2e cost basis.
+   */
+  hasPosition(symbol: string): boolean {
+    return this.positions.has(symbol);
+  }
+
+  /**
    * Setter pour permettre au stairstep-dispatcher d'enregistrer les positions
    * juste après un BUY confirmé. (Injection bidirectionnelle pas nécessaire :
    * c'est le dispatcher qui connaît le trailing, pas l'inverse.)

@@ -99,6 +99,7 @@ export class StairstepDispatcher {
     skippedFilterVolume: 0,
     skippedFilterC30s: 0,
     skippedInflight: 0,
+    skippedAlreadyHeld: 0,  // V3 (2026-05-13) — anti-doublon DCA (cf. bug MATH/UP)
     httpErrors: 0,
     networkErrors: 0,
     vercelSkips: 0,    // entry.ts a accepté mais skipped (cap, circuit breaker, etc.)
@@ -201,6 +202,31 @@ export class StairstepDispatcher {
       logger.info("[stairstep-dispatcher] inflight skip", { symbol });
       return;
     }
+
+    // ── 4.5 Anti-doublon : déjà une position ouverte sur ce symbol ? ─────
+    // V3 (2026-05-13) — Bug fix : 2× BUY MATH consécutifs sans SELL entre les deux.
+    // Le dispatcher ne vérifiait pas l'existence d'une position trailée → DCA non voulu.
+    // Le trailing écrasait la 1ère position dans son tracking → peak perdu.
+    // Solution : refuser BUY si trailing tracke déjà une position ouverte sur ce symbol.
+    if (this.trailing && this.trailing.hasPosition(symbol)) {
+      this.stats_.skippedAlreadyHeld++;
+      logger.info("[stairstep-dispatcher] already held — skip BUY", { symbol });
+      await this.logEntry({
+        ts: Date.now(),
+        symbol,
+        decision: "skipped",
+        reason: "already_held_v3",
+        snap,
+        signalPrice: snap.price,
+        httpStatus: null,
+        vercelReason: null,
+        vercelExecuted: null,
+        durationMs: Date.now() - startedAt,
+        error: null,
+      });
+      return;
+    }
+
     this.inflight.add(symbol);
 
     // ── 5. Dispatch HTTP ─────────────────────────────────────────────────
