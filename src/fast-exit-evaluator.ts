@@ -60,6 +60,7 @@ export class FastExitEvaluator {
 
   // Stats
   private ticksEvaluated = 0;
+  private ticksSkippedV3 = 0;  // V3 (2026-05-13) — counter pour positions worker_trailing skippées
   private rulesFired = 0;
   private dispatchOk = 0;
   private dispatchSkippedCooldown = 0;
@@ -95,6 +96,17 @@ export class FastExitEvaluator {
   evaluateTick(symbol: string, currentPrice: number, bestBid?: number | null): void {
     const pos = this.positions.updatePriceForSymbol(symbol, currentPrice, bestBid);
     if (!pos) return;  // not held
+
+    // V3 (2026-05-13) — CRITICAL FIX: skip positions managed by stairstep-trailing.
+    // Bug fixed 2026-05-13 18:16 : RAD V3 buy was killed by fast-exit fast_sl
+    // in <1min after BUY because this filter was missing. V3 positions have their
+    // OWN exit logic (stairstep-trailing.ts) with 3 conditions: hard_sl -8%,
+    // trailing peak-1pt, timeout 2h. fast-exit must not interfere.
+    if (pos.managedBy === "worker_trailing") {
+      this.ticksSkippedV3++;
+      return;
+    }
+
     this.ticksEvaluated++;
 
     // Always update tracker (keeps pnlMax/pnlMin fresh even if no dispatch)
@@ -231,6 +243,7 @@ export class FastExitEvaluator {
   stats() {
     return {
       ticksEvaluated: this.ticksEvaluated,
+      ticksSkippedV3: this.ticksSkippedV3,  // V3 (2026-05-13)
       rulesFired: this.rulesFired,
       byReasonCode: this.byReasonCode,
       dispatch: {

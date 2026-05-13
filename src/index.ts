@@ -195,6 +195,16 @@ async function main(): Promise<void> {
   stairstepDispatcher.setTrailing(stairstepTrailing);
   eventDetector.setStairstepDispatcher(stairstepDispatcher);
 
+  // V3 (2026-05-13) — Kill switch for legacy fast-exit-evaluator.
+  // Default: false (DISABLED) because all new positions are V3-managed.
+  // Set WORKER_FAST_EXIT_ENABLED=true ONLY if you have legacy non-V3 positions
+  // (opportunity/pump1h) that still need fast-exit surveillance.
+  // Background: bug 2026-05-13 18:16 — fast-exit killed a V3 BUY (RAD) in <1min.
+  // The L2 fix (skip managedBy:worker_trailing in evaluator) prevents this,
+  // but disabling entirely is even safer and saves CPU.
+  const WORKER_FAST_EXIT_ENABLED = (process.env.WORKER_FAST_EXIT_ENABLED ?? "false").toLowerCase() === "true";
+  logger.info("Fast-exit-evaluator status", { enabled: WORKER_FAST_EXIT_ENABLED });
+
   // 10. Tick handler — feeds buffers, detector, AND fast-exit-evaluator
   let totalTicks = 0;
   const onTick = (tick: Tick): void => {
@@ -206,7 +216,11 @@ async function main(): Promise<void> {
     // bestBid passed explicitly so fast-exit decisions use the actual SELL-side
     // price, not last_trade which can spike to fictive levels on thin orderbook
     // altcoins (root cause of pump1h slippage 05/05).
-    fastExitEvaluator.evaluateTick(tick.symbol, tick.price, tick.bestBid);
+    // V3 (2026-05-13) — Killswitch: skip entirely if WORKER_FAST_EXIT_ENABLED=false
+    // (default). This is defense L3 on top of L2 (managedBy filter in evaluator).
+    if (WORKER_FAST_EXIT_ENABLED) {
+      fastExitEvaluator.evaluateTick(tick.symbol, tick.price, tick.bestBid);
+    }
     // Lot 2 — multi-strategy event detection (passive, shadow:* writes only)
     eventDetector.evaluateTick(tick.symbol);
     // Lot 3 V3 (2026-05-13) — Trailing stop pour positions stair_step ouvertes.

@@ -74,6 +74,12 @@ export interface AgentPosition {
   // detector.tryDispatchSlowDown to decide which thresholds to apply.
   // undefined for legacy/early_pump positions → standard sub-min thresholds.
   dispatchSource?: string;
+  // V3 (2026-05-13) — managedBy lookup from agent:trade_meta.
+  // "worker_trailing" means the position is controlled by stairstep-trailing.
+  // Fast-exit-evaluator MUST skip these positions (V3 has its own exit logic).
+  // Bug fixed 2026-05-13 18:16 : RAD V3 buy was killed by fast-exit-evaluator
+  // in <1min after BUY because this filter was missing.
+  managedBy?: string;
 }
 
 interface TradeMetaEntry {
@@ -84,6 +90,8 @@ interface TradeMetaEntry {
   // BACKLOG-3 phase 7+ (2026-05-06) — read dispatchSource from trade_meta so
   // fallback path can propagate the routing info to detector exit thresholds.
   dispatchSource?: string;
+  // V3 (2026-05-13) — propagate managedBy through fallback path too.
+  managedBy?: string;
 }
 
 interface CoinbaseAccount {
@@ -322,6 +330,9 @@ export class PositionsTracker {
           // thresholds (FAST_TP_PUMP1H_PNL_PCT=15). If older Vercel doesn't
           // return it, stays undefined → standard sub-min thresholds (legacy).
           dispatchSource: r.dispatchSource,
+          // V3 (2026-05-13) — propagate managedBy. "worker_trailing" tells
+          // fast-exit-evaluator to SKIP this position (V3 has its own exit logic).
+          managedBy: r.managedBy,
         });
       }
       return positionsMap;
@@ -359,7 +370,7 @@ export class PositionsTracker {
     const STALE_META_MAX_AGE_MS = 24 * 60 * 60 * 1000;
     const now = Date.now();
     const tradeMeta = (await redisGet<Record<string, TradeMetaEntry>>(TRADE_META_KEY)) ?? {};
-    const metaBySymbol = new Map<string, { avgBuyPrice: number; buyTimestamp: number; dispatchSource?: string }>();
+    const metaBySymbol = new Map<string, { avgBuyPrice: number; buyTimestamp: number; dispatchSource?: string; managedBy?: string }>();
     for (const orderId of Object.keys(tradeMeta)) {
       const meta = tradeMeta[orderId];
       // BACKLOG-3 phase 7+ (2026-05-06) — Accept both "opportunity" AND
@@ -368,7 +379,9 @@ export class PositionsTracker {
       // When Vercel /api/agent/positions was unavailable (which happens often),
       // pump1h positions disappeared from the worker's position map. Discovered
       // 2026-05-06 when Vercel was down for hours and pump1h trades were misrouted.
-      if (!meta || (meta.type !== "opportunity" && meta.type !== "opportunity-pump1h")) continue;
+      // V3 (2026-05-13) — Also accept "opportunity-stairstep" so V3 positions
+      // are visible in the fallback path (otherwise managedBy filter wouldn't fire).
+      if (!meta || (meta.type !== "opportunity" && meta.type !== "opportunity-pump1h" && meta.type !== "opportunity-stairstep")) continue;
       if (typeof meta.avgBuyPrice !== "number" || typeof meta.buyTimestamp !== "number" || !meta.symbol) continue;
       if ((now - meta.buyTimestamp) > STALE_META_MAX_AGE_MS) continue;
       const existing = metaBySymbol.get(meta.symbol);
@@ -377,6 +390,7 @@ export class PositionsTracker {
           avgBuyPrice: meta.avgBuyPrice,
           buyTimestamp: meta.buyTimestamp,
           dispatchSource: meta.dispatchSource,
+          managedBy: meta.managedBy,
         });
       }
     }
@@ -397,6 +411,7 @@ export class PositionsTracker {
         pnlPct: 0,
         valueUSD,
         dispatchSource: meta.dispatchSource,
+        managedBy: meta.managedBy,
       });
     }
     return newPositions;
