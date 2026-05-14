@@ -67,6 +67,21 @@ const WORKER_PUMP1H_HOURLY_COUNTER_KEY = "worker:hourly_pump1h_count";
 const WORKER_PUMP1H_DISPATCHED_KEY_PREFIX = "worker:dispatched:pump1h:";  // + symbol
 const WORKER_PUMP1H_HOURLY_CAP = 5;
 const WORKER_PUMP1H_THROTTLE_MS = 60 * 60 * 1000;  // 60min per-asset
+
+// 2026-05-14 — LEGACY DRYRUN LOGS kill switch.
+// With V3 (stairstep_trailing) live and legacy paths neutralized via
+// WORKER_LEGACY_DISPATCH_ENABLED, the dryrun:fastpath_log /
+// dryrun:early_dispatch_log / dryrun:pump1h_dispatch_log keys are written
+// continuously (~470k entries/day) but consumed by no analysis tool — the
+// V3 analysis pipeline reads shadow:events_completed instead.
+//
+// On 14/05 the Redis traffic from these three logs alone reached 11 Go in
+// less than 12h (estimated 1M+ LPUSH+LTRIM commands/day). Pure waste.
+//
+// Convention: default false (= logs DISABLED). Set =true if you need to
+// re-enable for retrospective comparison or debugging. shadow:events_completed
+// and dryrun:slow_down_dispatch_log are always kept (low volume + useful).
+const WORKER_LEGACY_DRYRUN_LOGS_ENABLED = (process.env.WORKER_LEGACY_DRYRUN_LOGS_ENABLED ?? "false").toLowerCase() === "true";
 import {
   classifySignal,
   evaluateFastPathCandidate,
@@ -1297,6 +1312,10 @@ export class Detector {
   /**
    * Buffers an early-dispatch observation for periodic flush to
    * dryrun:early_dispatch_log.
+   *
+   * 2026-05-14 — Gated by WORKER_LEGACY_DRYRUN_LOGS_ENABLED. Default off
+   * to suppress ~157k Redis writes/day (legacy path is neutralized in V3,
+   * the log is no longer analytically consumed).
    */
   private recordEarlyDispatch(
     ts: number,
@@ -1306,6 +1325,7 @@ export class Detector {
     dispatched: boolean,
     dispatchSkipReason?: string,
   ): void {
+    if (!WORKER_LEGACY_DRYRUN_LOGS_ENABLED) return;
     this.pendingEarlyDispatch.push({
       ts,
       parisTime: formatParisTime(ts),
@@ -1367,6 +1387,10 @@ export class Detector {
    * PUMP-1H DETECTOR (NEW 2026-05-03) — log buffer entry for pump1h_dispatch_log.
    * Mirrors recordEarlyDispatch shape (just with isPump1h instead of isEarly,
    * and severity sentinel "pump1h").
+   *
+   * 2026-05-14 — Gated by WORKER_LEGACY_DRYRUN_LOGS_ENABLED. Default off
+   * to suppress ~213k Redis writes/day (legacy pump1h path is neutralized
+   * in V3, the log is no longer analytically consumed).
    */
   private recordPump1hDispatch(
     ts: number,
@@ -1376,6 +1400,7 @@ export class Detector {
     dispatched: boolean,
     dispatchSkipReason?: string,
   ): void {
+    if (!WORKER_LEGACY_DRYRUN_LOGS_ENABLED) return;
     this.pendingPump1h.push({
       ts,
       parisTime: formatParisTime(ts),
@@ -1422,6 +1447,7 @@ export class Detector {
    * empty shells (numeric metrics only, no labels).
    */
   private recordFastPath(ts: number, c: MomentumCandidate): void {
+    if (!WORKER_LEGACY_DRYRUN_LOGS_ENABLED) return;
     const verdict = evaluateFastPathCandidate(c);
     // Decision is what the fast-path verdict said: "qualified" if it would have fired
     // in production, "observed" otherwise (still useful for retrospective calibration).
