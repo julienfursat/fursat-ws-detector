@@ -189,6 +189,13 @@ async function main(): Promise<void> {
   //   - Reconcile Coinbase toutes les 60s (drop positions vendues ailleurs)
   const stairstepTrailing = new StairstepTrailing(positions);
   await stairstepTrailing.loadFromRedis();
+  // 2026-05-15 — Adoption au boot des holdings Coinbase non trackés (>$5).
+  // Cas observé 14/05 : positions SEAM/INDEX/PLU adoptées au démarrage V3 sans
+  // être trackées → invisibles au SL/trailing, retries SELL infinis. Cette étape
+  // crée un OpenPosition synthétique pour chacune avec cost basis FIFO Coinbase.
+  // Best-effort : si /api/agent/positions fail, le worker démarre quand même.
+  // Désactivable via env var STAIRSTEP_ADOPT_INHERITED_ENABLED=false en cas de rollback.
+  await stairstepTrailing.adoptInheritedPositions();
   stairstepTrailing.start();
 
   const stairstepDispatcher = new StairstepDispatcher();

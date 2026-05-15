@@ -83,6 +83,33 @@ const FURSAT_API_BASE = (process.env.FURSAT_API_BASE ?? "https://www.fursat.net"
 const SELL_URL = `${FURSAT_API_BASE}/api/agent/sell-stairstep`;
 const SELL_TIMEOUT_MS = 15_000;
 
+// 2026-05-15 — Position freeze sur SELL_FAILED répétés.
+// Observation 14/05 sur SEAM: 76 SELL_FAILED en 1h avec erreur "limit only mode",
+// boucle infinie qui polluait trades_log et bloquait potentiellement d'autres ops.
+// Si N SELL_FAILED en <FREEZE_WINDOW_MS sur le même symbol → marquer comme broken
+// pour stopper les retries jusqu'à intervention manuelle (vente Coinbase + restart worker).
+const SELL_FAIL_FREEZE_THRESHOLD = parseInt(process.env.STAIRSTEP_SELL_FAIL_FREEZE_THRESHOLD ?? "5", 10);
+const SELL_FAIL_FREEZE_WINDOW_MS = parseInt(process.env.STAIRSTEP_SELL_FAIL_FREEZE_WINDOW_MS ?? "300000", 10);  // 5min
+
+// 2026-05-15 — Fallback limit SELL sur erreur "limit only mode".
+// Coinbase passe certains orderbooks (mid-cap notamment) en limit-only à certains
+// moments (volatilité accrue, maintenance). Les market IOC SELL sont rejetés en boucle.
+// Si on détecte ce code d'erreur, on retente en GTD limit price = current_price × (1 - FALLBACK_LIMIT_SPREAD_PCT).
+// Le SELL tape donc plus bas que le best_bid pour garantir le fill, en acceptant un slippage contrôlé.
+const FALLBACK_LIMIT_ENABLED = (process.env.STAIRSTEP_FALLBACK_LIMIT_ENABLED ?? "true").toLowerCase() === "true";
+const FALLBACK_LIMIT_SPREAD_PCT = parseFloat(process.env.STAIRSTEP_FALLBACK_LIMIT_SPREAD_PCT ?? "2.0");
+const LIMIT_ONLY_MODE_PATTERN = /limit only mode/i;
+
+// 2026-05-15 — Adoption au boot des positions Coinbase non trackées par V3.
+// Observation 14/05 : SEAM, INDEX, PLU étaient sur Coinbase mais pas dans
+// stairstep:open_positions → invisibles au trailing, pas de SL, pas de trailing.
+// Au démarrage on appelle /api/agent/positions (Vercel) qui retourne le cost basis
+// FIFO + dust threshold $5. On adopte les holdings non-dust qui ne sont pas déjà trackés.
+// Désactivable via env var en cas de besoin de rollback rapide.
+const ADOPT_INHERITED_ENABLED = (process.env.STAIRSTEP_ADOPT_INHERITED_ENABLED ?? "true").toLowerCase() === "true";
+const ADOPT_INHERITED_MIN_USD = parseFloat(process.env.STAIRSTEP_ADOPT_INHERITED_MIN_USD ?? "5.0");
+const ADOPT_INHERITED_TIMEOUT_MS = parseInt(process.env.STAIRSTEP_ADOPT_INHERITED_TIMEOUT_MS ?? "15000", 10);
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface OpenPosition {
@@ -113,6 +140,12 @@ export class StairstepTrailing {
   private inflight = new Set<string>();    // symboles avec SELL en cours
   private positionsTracker: PositionsTracker;
 
+  // 2026-05-15 — Tracking SELL_FAILED par symbol pour freeze anti-boucle.
+  // Map symbol → array de timestamps de fails dans la fenêtre récente.
+  // Map symbol → reason du freeze (pour debug / dashboard).
+  private failedSells = new Map<string, number[]>();
+  private frozenSymbols = new Map<string, { since: number; reason: string }>();
+
   // Stats
   private stats_ = {
     positionsOpened: 0,
@@ -129,6 +162,11 @@ export class StairstepTrailing {
     reconcileDropped: 0,    // positions droppées car Coinbase n'a plus la balance
     reconcileGraced: 0,     // V3 hotfix : positions épargnées par grace period (jeunes < 90s)
     reloadFromRedis: 0,
+    // 2026-05-15 — Nouveaux compteurs
+    sellsFrozenSkipped: 0,        // SELL skippés parce que symbol frozen
+    sellsFallbackLimit: 0,         // SELL retry en fallback limit après "limit only mode"
+    sellsFallbackLimitOk: 0,       // Dont succès
+    symbolsFrozen: 0,              // Total de symboles passés en frozen
   };
 
   // Timer reconciliation
@@ -186,6 +224,154 @@ export class StairstepTrailing {
       logger.warn("[stairstep-trailing] loadFromRedis failed", {
         err: (err as Error).message,
       });
+    }
+  }
+
+  /**
+   * 2026-05-15 — Adoption au boot des positions Coinbase non trackées.
+   *
+   * Appelée APRÈS loadFromRedis(), AVANT le wiring de evaluateTick.
+   * Pour chaque holding Coinbase non-dust (>$5 par défaut) qui n'est PAS
+   * déjà tracké dans this.positions, on crée un OpenPosition synthétique
+   * avec avgBuyPrice = cost basis FIFO retourné par /api/agent/positions.
+   *
+   * Le trailing pourra alors :
+   *   - Appliquer HARD_SL si la position s'effondre
+   *   - Appliquer TRAILING si elle peak et retrace
+   *   - Appliquer TIMEOUT si elle stagne 2h sans peak
+   *
+   * Sans cette adoption, les positions héritées (post-déploiement V3 ou
+   * post-restart worker) étaient des zombies sans protection.
+   *
+   * Cas observé 14/05 : SEAM, INDEX, PLU non trackées →
+   *   - Pas de HARD_SL à -8% (descendues plus bas)
+   *   - SELL retries en boucle déclenchés par autre mécanisme (à investiguer)
+   *
+   * Note importante : on ne PEUT PAS retrouver le buyTimestamp original
+   * (l'info est dans l'historique Coinbase pas exploité ici). On utilise
+   * Date.now() comme buyTimestamp synthétique → la position commence
+   * sa fenêtre TIMEOUT 2h maintenant. C'est plus permissif que strict
+   * mais évite les TIMEOUT instantanés au boot.
+   */
+  async adoptInheritedPositions(): Promise<void> {
+    if (!ADOPT_INHERITED_ENABLED) {
+      logger.info("[stairstep-trailing] adoption disabled via env var");
+      return;
+    }
+
+    try {
+      const apiBase = FURSAT_API_BASE;
+      const cronSecret = process.env.CRON_SECRET ?? process.env.CRYPTO_AGENT_SECRET ?? "";
+      if (!cronSecret) {
+        logger.warn("[stairstep-trailing] adoption skipped: CRON_SECRET missing");
+        return;
+      }
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), ADOPT_INHERITED_TIMEOUT_MS);
+
+      const res = await fetch(`${apiBase}/api/agent/positions`, {
+        method: "GET",
+        headers: {
+          "x-agent-secret": cronSecret,
+          "x-cron-secret": cronSecret,
+          "x-source": "ws-worker-adopt",
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        logger.warn("[stairstep-trailing] adoption failed: HTTP error", { status: res.status });
+        return;
+      }
+
+      const data = await res.json() as {
+        positions?: Array<{
+          asset: string;
+          amount: number;
+          usdValue: number;
+          avgCost?: number;       // cost basis FIFO
+          // d'autres champs peuvent exister, on ne s'en sert pas ici
+        }>;
+      };
+
+      if (!data.positions || !Array.isArray(data.positions)) {
+        logger.warn("[stairstep-trailing] adoption: positions field missing or invalid");
+        return;
+      }
+
+      let adopted = 0;
+      let skippedDust = 0;
+      let skippedAlreadyTracked = 0;
+      let skippedNoCost = 0;
+      const adoptedSymbols: string[] = [];
+
+      for (const p of data.positions) {
+        const symbol = p.asset;
+        if (!symbol || symbol === "USDC" || symbol === "USD") continue;
+
+        // Skip si déjà tracké (Redis reload)
+        if (this.positions.has(symbol)) {
+          skippedAlreadyTracked++;
+          continue;
+        }
+
+        // Skip si dust
+        if (typeof p.usdValue !== "number" || p.usdValue < ADOPT_INHERITED_MIN_USD) {
+          skippedDust++;
+          continue;
+        }
+
+        // Skip si cost basis indisponible (impossible de calculer PnL)
+        if (typeof p.avgCost !== "number" || p.avgCost <= 0) {
+          skippedNoCost++;
+          logger.warn(`[stairstep-trailing] adoption: ${symbol} skipped, no valid avgCost (${p.avgCost})`);
+          continue;
+        }
+
+        // Adoption : crée une OpenPosition synthétique
+        const now = Date.now();
+        const sizingUsdc = p.usdValue;       // valeur USD actuelle = sizing estimé
+        const currentPrice = p.usdValue / p.amount;  // price ≈ usdValue / size
+        const adoptedPos: OpenPosition = {
+          symbol,
+          buyOrderId: `adopted-boot-${now}`,
+          buyTimestamp: now,                  // synthétique, fenêtre TIMEOUT démarre maintenant
+          avgBuyPrice: p.avgCost,
+          sizingUsdc,
+          peakPnlPct: 0,
+          peakPriceAt: now,
+          peakPrice: p.avgCost,
+          troughPnlPct: 0,
+          troughPriceAt: now,
+          currentPnlPct: ((currentPrice - p.avgCost) / p.avgCost) * 100,
+          currentPrice,
+          lastTickAt: now,
+          lastPersistedAt: 0,
+          lastPersistedPeakPnl: 0,
+        };
+
+        this.positions.set(symbol, adoptedPos);
+        adopted++;
+        adoptedSymbols.push(symbol);
+
+        // Persiste dans Redis pour qu'au prochain restart la position soit reload-ée
+        // normalement plutôt que ré-adoptée (idempotent mais moins de bruit log)
+        await this.persistPosition(adoptedPos, true);
+      }
+
+      this.stats_.positionsOpened += adopted;
+      logger.info("[stairstep-trailing] Inherited positions adoption complete", {
+        adopted, skippedDust, skippedAlreadyTracked, skippedNoCost,
+        symbols: adoptedSymbols,
+        thresholdUsd: ADOPT_INHERITED_MIN_USD,
+      });
+    } catch (err) {
+      logger.warn("[stairstep-trailing] adoption threw", {
+        err: (err as Error).message,
+      });
+      // On ne throw pas : adoption en best-effort, le worker démarre quand même.
     }
   }
 
@@ -330,6 +516,23 @@ export class StairstepTrailing {
    */
   private async triggerSell(pos: OpenPosition, reason: ExitReason): Promise<void> {
     if (this.inflight.has(pos.symbol)) return;
+
+    // 2026-05-15 — Skip immédiat si symbol frozen.
+    // Évite la boucle infinie observée 14/05 sur SEAM (76 SELL_FAILED en 1h).
+    // L'opérateur doit vendre manuellement Coinbase + redémarrer le worker pour
+    // décharger le frozen state (qui n'est pas persisté Redis, c'est intentionnel
+    // pour forcer une intervention consciente).
+    const frozen = this.frozenSymbols.get(pos.symbol);
+    if (frozen) {
+      this.stats_.sellsFrozenSkipped++;
+      // Log throttlé : 1 fois toutes les 5min pour éviter pollution
+      const sinceFrozenMin = (Date.now() - frozen.since) / 60_000;
+      if (this.stats_.sellsFrozenSkipped % 100 === 1) {
+        logger.warn(`[stairstep-trailing] SELL skipped ${pos.symbol}: frozen since ${sinceFrozenMin.toFixed(0)}min ago (${frozen.reason})`);
+      }
+      return;
+    }
+
     this.inflight.add(pos.symbol);
     this.stats_.sellsAttempted++;
     this.stats_.sellsByReason[reason]++;
@@ -349,7 +552,8 @@ export class StairstepTrailing {
       return;
     }
 
-    const payload = {
+    // 2026-05-15 — Construction du payload, avec champs optionnels pour fallback limit.
+    const payload: any = {
       symbol: pos.symbol,
       reason,
       entryPrice: pos.avgBuyPrice,
@@ -392,6 +596,48 @@ export class StairstepTrailing {
       return;
     }
 
+    // 2026-05-15 — Détection "limit only mode" → retry fallback limit.
+    // Coinbase passe certains orderbooks en limit-only à certains moments.
+    // Le market IOC SELL est rejeté, mais un GTD limit -2% peut passer.
+    const errorText = String(body?.reason ?? body?.error ?? "");
+    if (!ok && FALLBACK_LIMIT_ENABLED && LIMIT_ONLY_MODE_PATTERN.test(errorText)) {
+      logger.warn(`[stairstep-trailing] Detected "limit only mode" for ${pos.symbol}, retrying with limit GTD -${FALLBACK_LIMIT_SPREAD_PCT}%`);
+      this.stats_.sellsFallbackLimit++;
+
+      const limitPayload = {
+        ...payload,
+        orderType: "limit_gtd",
+        limitPrice: pos.currentPrice * (1 - FALLBACK_LIMIT_SPREAD_PCT / 100),
+        fallbackFromLimitOnly: true,
+      };
+
+      const controller2 = new AbortController();
+      const timeoutId2 = setTimeout(() => controller2.abort(), SELL_TIMEOUT_MS);
+      try {
+        const res2 = await fetch(SELL_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-cron-secret": cronSecret,
+            "x-agent-secret": cronSecret,
+            "x-source": "ws-worker",
+          },
+          body: JSON.stringify(limitPayload),
+          signal: controller2.signal,
+        });
+        clearTimeout(timeoutId2);
+        httpStatus = res2.status;
+        try { body = await res2.json(); } catch {/* non-JSON */}
+        ok = res2.ok && body?.success === true;
+        if (ok) this.stats_.sellsFallbackLimitOk++;
+      } catch (err) {
+        clearTimeout(timeoutId2);
+        logger.warn("[stairstep-trailing] Fallback limit SELL also failed", {
+          symbol: pos.symbol, err: (err as Error).message,
+        });
+      }
+    }
+
     // ─ Append local log (sync best-effort) ───────────────────────────────
     void this.appendTradeLog({
       ts: Date.now(),
@@ -422,6 +668,8 @@ export class StairstepTrailing {
       this.positions.delete(pos.symbol);
       this.stats_.positionsClosed++;
       await this.deletePersistedPosition(pos.symbol);
+      // 2026-05-15 — Cleanup tracking SELL fails (succès = série interrompue)
+      this.failedSells.delete(pos.symbol);
     } else {
       // SELL fail OR Vercel reported success: false (e.g. PASSIVE_MODE, no_balance)
       // On garde la position en RAM pour retry au prochain tick éligible,
@@ -433,6 +681,7 @@ export class StairstepTrailing {
         });
         this.positions.delete(pos.symbol);
         await this.deletePersistedPosition(pos.symbol);
+        this.failedSells.delete(pos.symbol);  // cleanup tracking
       } else if (body?.passiveMode === true) {
         // PASSIVE_MODE : la position virtuelle reste, on simule un retry au tick suivant.
         // C'est utile pour dev/test mais en prod le SELL devrait passer.
@@ -444,6 +693,26 @@ export class StairstepTrailing {
         logger.warn("[stairstep-trailing] SELL fail, will retry next tick", {
           symbol: pos.symbol, vercelReason, httpStatus,
         });
+
+        // 2026-05-15 — Tracking et freeze sur fails répétés.
+        // Si on dépasse SELL_FAIL_FREEZE_THRESHOLD fails dans la fenêtre récente
+        // (SELL_FAIL_FREEZE_WINDOW_MS), on fige le symbol pour stopper les retries.
+        const now = Date.now();
+        const cutoff = now - SELL_FAIL_FREEZE_WINDOW_MS;
+        const fails = this.failedSells.get(pos.symbol) ?? [];
+        // Garde seulement les fails dans la fenêtre récente
+        const recentFails = fails.filter(t => t >= cutoff);
+        recentFails.push(now);
+        this.failedSells.set(pos.symbol, recentFails);
+
+        if (recentFails.length >= SELL_FAIL_FREEZE_THRESHOLD) {
+          this.frozenSymbols.set(pos.symbol, {
+            since: now,
+            reason: `${recentFails.length} SELL_FAILED in ${(SELL_FAIL_FREEZE_WINDOW_MS / 60_000).toFixed(0)}min (last error: ${String(vercelReason).slice(0, 100)})`,
+          });
+          this.stats_.symbolsFrozen++;
+          logger.error(`🥶 STAIRSTEP SYMBOL FROZEN: ${pos.symbol} — ${recentFails.length} fails in ${(SELL_FAIL_FREEZE_WINDOW_MS / 60_000).toFixed(0)}min, last error: ${vercelReason}. Vendre manuellement sur Coinbase + restart worker pour reprendre.`);
+        }
       }
     }
 
@@ -562,13 +831,40 @@ export class StairstepTrailing {
       openPositions: this.positions.size,
       inflight: this.inflight.size,
       symbols: [...this.positions.keys()],
+      // 2026-05-15 — Liste des symboles frozen avec contexte pour le dashboard
+      frozenSymbols: [...this.frozenSymbols.entries()].map(([sym, info]) => ({
+        symbol: sym,
+        sinceMs: info.since,
+        sinceMinutesAgo: ((Date.now() - info.since) / 60_000),
+        reason: info.reason,
+      })),
       config: {
         hardStopLossPct: HARD_STOP_LOSS_PCT,
         minPeakPct: MIN_PEAK_PCT,
         trailingDeltaPct: TRAILING_DELTA_PCT,
         timeoutNoPeakHours: TIMEOUT_NO_PEAK_MS / 3600_000,
+        // 2026-05-15 — Config freeze + fallback limit
+        sellFailFreezeThreshold: SELL_FAIL_FREEZE_THRESHOLD,
+        sellFailFreezeWindowMin: SELL_FAIL_FREEZE_WINDOW_MS / 60_000,
+        fallbackLimitEnabled: FALLBACK_LIMIT_ENABLED,
+        fallbackLimitSpreadPct: FALLBACK_LIMIT_SPREAD_PCT,
       },
     };
+  }
+
+  /**
+   * 2026-05-15 — Permet à un opérateur de débloquer manuellement un symbol frozen
+   * sans redémarrer le worker. Endpoint potentiel dashboard /api/agent/unfreeze.
+   * Note : ne supprime PAS la position du tracker ; il faut aussi avoir vendu manuellement
+   * sur Coinbase, sinon le worker va retenter de la vendre.
+   */
+  unfreezeSymbol(symbol: string): boolean {
+    const wasFrozen = this.frozenSymbols.delete(symbol);
+    if (wasFrozen) {
+      this.failedSells.delete(symbol);
+      logger.info(`🟢 [stairstep-trailing] ${symbol} unfrozen manually`);
+    }
+    return wasFrozen;
   }
 
   /**
